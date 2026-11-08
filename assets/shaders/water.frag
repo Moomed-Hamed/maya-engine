@@ -19,12 +19,13 @@ layout (binding = 0) uniform sampler2D foam_map;
 layout (binding = 1) uniform sampler2D scene_color;
 layout (binding = 2) uniform sampler2D scene_depth;
 layout (binding = 3) uniform sampler2D water_normal_map;
-layout (binding = 4) uniform sampler2D foam_pattern;
 layout (binding = 5) uniform sampler2D scene_normal;
 
 layout (location = 0) out vec4 pixel_color;
 
 uniform vec3  view_pos;
+uniform mat4  proj_view;
+uniform mat4  inv_proj_view;
 uniform vec2  screen_size;
 uniform float near_plane;
 uniform float far_plane;
@@ -50,11 +51,72 @@ uniform float fog_density;
 
 uniform vec3  foam_color;
 uniform float foam_roughness;
+uniform float shore_foam;
+uniform float sun_water;
+uniform vec3  water_absorb; // per-scene absorption, rgb == red/green/blue depth
 uniform float water_detail;
+uniform float water_chop; // small procedural ripples, independent of the detail map
 uniform float water_sss;
 uniform float water_time;
+uniform float ssr_on;
+uniform int   ssr_steps;
 
 const float PI = 3.14159265359;
+
+// ---- procedural sky detail -------------------------------------------------
+
+float hash21(vec2 p)
+{
+	vec2 q = fract(p * vec2(123.34, 456.21));
+	q += dot(q, q + 45.32);
+	return fract(q.x * q.y);
+}
+
+float value_noise(vec2 p)
+{
+	vec2 i = floor(p);
+	vec2 f = fract(p);
+	f = f * f * (3.0 - 2.0 * f);
+	float a = hash21(i);
+	float b = hash21(i + vec2(1.0, 0.0));
+	float c = hash21(i + vec2(0.0, 1.0));
+	float d = hash21(i + vec2(1.0, 1.0));
+	return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float cloud_fbm(vec2 p)
+{
+	float v = 0.0;
+	float a = 0.5;
+	for (int i = 0; i < 4; i++)
+	{
+		v += a * value_noise(p);
+		p = p * 2.03 + 17.1;
+		a *= 0.5;
+	}
+	return v;
+}
+
+// single-scattering atmosphere, matching the deferred sky
+vec3 atmosphere(vec3 dir)
+{
+    vec3 L_sun = -sun_direction;
+    float mu = max(dot(dir, L_sun), 0.0);
+    float h = max(dir.y, 0.0);
+    float sun_height = clamp(-sun_direction.y, 0.0, 1.0);
+    float airmass = 1.0 / (h + 0.16);
+
+    float phase_r = 0.75 * (1.0 + mu * mu);
+    vec3 rayleigh = vec3(0.055, 0.200, 0.620) * phase_r * airmass;
+
+    const float g = 0.76;
+    float denom = max(1.0 + g*g - 2.0*g*mu, 1e-4);
+    float phase_m = (1.0 - g*g) / (4.0 * PI * pow(denom, 1.5));
+    vec3 mie_tint = mix(vec3(1.0, 0.62, 0.32), vec3(1.0, 0.92, 0.82), sun_height);
+    vec3 mie = mie_tint * phase_m * airmass;
+
+    return (rayleigh * 0.010 + mie * 0.006) * (sun_color * sun_power);
+}
 
 // ---- environment : the same sky the opaque pass uses ----------------------
 vec3 environment(vec3 dir)
@@ -67,15 +129,19 @@ vec3 environment(vec3 dir)
 	vec2 flat_sun = normalize(vec2(L_sun.x, L_sun.z) + vec2(1e-4, 0.0));
 	float azimuth = max(dot(flat_dir, flat_sun), 0.0);
 
-	vec3 horizon = mix(haze, glow, pow(azimuth, 3.0) * 0.85);
+	vec3 horizon = mix(haze, glow, pow(azimuth, 3.0) * 0.35);
 	vec3 col = (h > 0.0) ? mix(horizon, zenith, pow(h, 0.55))
 	                     : mix(horizon, ground, pow(-h, 0.45));
 
 	// no sun or moon disk here. a rough surface never mirrors a hard disk : the
 	// reflection is broad sky scatter, and the tight glint is the GGX lobe below.
 	// a disk in this function reads as a second sun sitting under the water.
+	float above = smoothstep(0.0, 0.12, h);
 	float d = max(dot(dir, L_sun), 0.0);
-	vec3 sky = col + sun_color * (pow(d, 10.0) * 0.16 + pow(d, 3.0) * 0.03);
+	vec3 sky = col + atmosphere(dir) * above;
+	float high = smoothstep(0.02, 0.40, h);
+	sky = mix(sky, sky * vec3(0.55, 0.78, 1.35), 0.60 * high);
+	sky += sun_color * (pow(d, 10.0) * 0.16 + pow(d, 3.0) * 0.03) * sun_water;
 
 	vec3 L_moon = -moon_direction;
 	float dm = max(dot(dir, L_moon), 0.0);
@@ -87,6 +153,51 @@ vec3 ambient_irradiance(vec3 N)
 {
 	return (N.y > 0.0) ? mix(ambient_side, ambient_up,   smoothstep(0.0, 1.0,  N.y))
 	                   : mix(ambient_side, ambient_down, smoothstep(0.0, 1.0, -N.y));
+}
+
+// ---- screen-space reflection ----------------------------------------------
+// march the reflected ray through the opaque depth buffer. the hit is weighted by
+// a screen-edge and thickness confidence, so a marginal hit fades into the sky
+// rather than popping a stretched colour patch across the surface
+vec4 screen_reflection(vec3 P, vec3 R)
+{
+	if (ssr_steps <= 0) return vec4(0.0);
+	float t = 0.15;
+	float step_len = 0.30;
+	vec3 start = P + R * 0.04;
+	for (int i = 0; i < 24; i++)
+	{
+		if (i >= ssr_steps) break;
+		vec3 Q = start + R * t;
+		vec4 clip = proj_view * vec4(Q, 1.0);
+		if (clip.w <= 0.0) break;
+		vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+		if (uv.x <= 0.002 || uv.x >= 0.998 || uv.y <= 0.002 || uv.y >= 0.998) break;
+
+		float d = texture(scene_depth, uv).r;
+		if (d < 0.9999)
+		{
+			vec4 ndc = vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+			vec4 wp = inv_proj_view * ndc;
+			vec3 SP = wp.xyz / wp.w;
+			float ray_d = length(Q - view_pos);
+			float scene_d = length(SP - view_pos);
+			float diff = ray_d - scene_d;
+			float thick = max(0.10, t * 0.08);
+			if (scene_d < ray_d && diff < thick
+			    && SP.y > mat_a.a - 0.02) // never reflect the submerged floor
+			{
+				float edge = smoothstep(0.0, 0.10, uv.x) * smoothstep(0.0, 0.10, 1.0 - uv.x)
+				           * smoothstep(0.0, 0.10, uv.y) * smoothstep(0.0, 0.10, 1.0 - uv.y);
+				float conf = edge * (1.0 - smoothstep(thick * 0.5, thick, diff));
+				return vec4(texture(scene_color, uv).rgb, conf);
+			}
+		}
+
+		t += step_len;
+		step_len *= 1.12;
+	}
+	return vec4(0.0);
 }
 
 // ---- brdf -----------------------------------------------------------------
@@ -127,6 +238,10 @@ void main()
 	float water_level = mat_a.a;
 	float dist = length(vs_out.world_position - view_pos);
 
+	float water_z = linear_depth(gl_FragCoord.z);
+	float scene_z = linear_depth(texture(scene_depth, screen_uv).r);
+	float thickness = clamp(scene_z - water_z, 0.0, 80.0);
+
 	// short chop : three world-space scales of the 16 m cascade. the fine layers
 	// fade with distance so the horizon does not shimmer
 	vec2 detail_uv = vs_out.world_position.xz * (1.0 / 16.0);
@@ -140,54 +255,92 @@ void main()
 	vec3 detail = vec3(d1.x + d2.x + d3.x * .55, 0.0,
 	                   d1.y + d2.y + d3.y * .55) * (water_detail * 0.68 * detail_fade);
 	vec3 N = vs_out.normal + detail;
-	// the chop can only tip the surface so far : a normal that points down samples
-	// the dark ground hemisphere and reads as a black patch on the sea
-	N.y = max(N.y, 0.12);
+
+	// small procedural ripples : the shallow patch has no second normal cascade,
+	// and even the ocean benefits from a fine chop that does not tile
+	vec2 mp = vs_out.world_position.xz;
+	float mt = water_time;
+	// calm the fine ripples with depth : a deep sea is smoother than a puddle
+	float depth_ripple = 1.0 - 0.55 * smoothstep(1.0, 10.0, thickness);
+	vec2 micro = vec2(
+		sin(mp.x * 2.7 + mt * 1.3 + sin(mp.y * 1.9 - mt * 0.7)),
+		cos(mp.y * 2.3 - mt * 1.1 + sin(mp.x * 1.5 + mt * 0.9)));
+	N += vec3(micro.x, 0.0, micro.y) * (0.70 * water_chop * detail_fade * depth_ripple);
+
+	// a finer layer breaks the surface into small facets, so the sky reflection
+	// sparkles instead of reading as one smooth sheet
+	float fine_fade = 1.0 - smoothstep(12.0, 80.0, dist);
+	vec2 micro2 = vec2(
+		sin(mp.x * 9.7 - mt * 1.7 + sin(mp.y * 7.3 + mt * 1.1)),
+		cos(mp.y * 8.1 + mt * 1.4 + sin(mp.x * 6.7 - mt * 1.3)));
+	N += vec3(micro2.x, 0.0, micro2.y) * (0.90 * water_chop * fine_fade * depth_ripple);
+
+	// refraction uses the full ripple field : the bottom must visibly wobble
+	vec3 N_refr = normalize(N);
+
+	N.y = max(N.y, 0.55);
 	N = normalize(N);
 	vec3 Nup = N; // always the sunlit side, even when the face is seen from below
 
 	// seen from under the surface the same normal belongs to the underside, so it
 	// must face the camera or fresnel picks the dark reflection every time
-	if (!gl_FrontFacing) N = -N;
+	if (!gl_FrontFacing) { N = -N; N_refr = -N_refr; }
 
 	// glitter : a tiny high-frequency normal just for the sun/moon highlight. the
 	// lace mask is already in memory, so it makes a cheap sparkle field
 	float glitter_fade = 1.0 - smoothstep(18.0, 110.0, dist);
 	vec2 g_uv = vs_out.world_position.xz / 2.7 + vec2(water_time * .020, water_time * .011);
-	float gx = texture(foam_pattern, g_uv).r - 0.5;
-	float gz = texture(foam_pattern, g_uv.yx + vec2(.31, .17)).r - 0.5;
-	vec3 Ng = normalize(N + vec3(gx, 0.0, gz) * (0.20 * water_detail * glitter_fade));
-	Ng.y = max(Ng.y, 0.12);
+	float gx = value_noise(g_uv * 9.0) - 0.5;
+	float gz = value_noise(g_uv.yx * 9.0 + vec2(.31, .17)) - 0.5;
+	vec3 Ng = normalize(N + vec3(gx, 0.0, gz) * (0.04 * water_detail * glitter_fade));
+	Ng.y = max(Ng.y, 0.40);
 	Ng = normalize(Ng);
-
-	float water_z = linear_depth(gl_FragCoord.z);
-	float scene_z = linear_depth(texture(scene_depth, screen_uv).r);
-	float thickness = clamp(scene_z - water_z, 0.0, 40.0);
 
 	// refraction : bend the screen lookup by the surface normal, then fall back to
 	// the unshifted pixel if the shifted one belongs to a nearer surface
-	vec2 refr_uv = screen_uv + N.xz * (0.025 / max(water_z, 0.5));
+	vec2 refr_uv = screen_uv + N_refr.xz * (0.032 / max(water_z, 0.8));
 	refr_uv = clamp(refr_uv, vec2(0.001), vec2(0.999));
 	float refr_z = linear_depth(texture(scene_depth, refr_uv).r);
-	if (refr_z < water_z) refr_uv = screen_uv;
+	float refr_ok = smoothstep(0.0, 0.25, refr_z - water_z);
+	refr_uv = mix(screen_uv, refr_uv, refr_ok);
 
 	vec3 background = texture(scene_color, refr_uv).rgb;
 
-	// absorption : red dies first, then green, so the depth reads as water rather
-	// than a tinted window. the scattered part is lit by the same rig.
-	vec3 deep = pow(mat_a.rgb, vec3(2.2)) * 6.0; // volume colour, not a surface albedo
-	vec3 transmittance = exp(-thickness * vec3(0.34, 0.10, 0.065));
-	vec3 scattered = deep * (ambient_irradiance(vec3(0.0, 1.0, 0.0)) * 1.4
-	                       + sun_color * sun_power * 0.25);
-	vec3 beneath = background * transmittance + scattered * (1.0 - transmittance);
+	// absorption : red dies first, then green. the water itself is clear until
+	// the path gets long, so a shallow pool shows its sand almost unchanged
+	vec3 transmittance = exp(-thickness * water_absorb);
 
-	// fresnel : more sky at grazing angles. the reflected ray is kept above the
-	// horizon so a steep facet can never reflect the dark underwater hemisphere
+	// in-scattering : the water volume slowly adds its own colour as the path
+	// through it grows. this is what turns a clear shallows into a blue sea
+	float scatter_amount = 1.0 - exp(-thickness * 0.35);
+	// neutral light level for the volume : the authored water colour should not
+	// pick up a strong green cast from a cyan ambient
+	float water_light = dot(ambient_up, vec3(0.3333))
+	                  + dot(sun_color, vec3(0.3333)) * sun_power * 0.05;
+
+	// depth ramp : shallow water scatters turquoise, deep water the authored blue.
+	// the change with thickness is the main cue for how deep the water is
+	float depth_t = 1.0 - exp(-thickness * 0.150);
+	vec3 shallow_col = vec3(0.030, 0.140, 0.155);
+	vec3 deep_col = mat_a.rgb * 1.9;
+	vec3 body_col = mix(shallow_col, deep_col, depth_t);
+	vec3 scatter = body_col * (1.35 * water_light);
+	vec3 beneath = background * transmittance + scatter * scatter_amount;
+
+	// fresnel : glassy toward the horizon, nearly transparent when looked into
+	// from above. the reflected ray is only slightly biased toward the normal,
+	// so the ripples still appear in the reflection
 	float NdotV = max(dot(N, V), 1e-3);
-	float fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
+	float cosv = mix(clamp(V.y, 0.0, 1.0), NdotV, 0.30);
+	float fresnel = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);
 	vec3 R = reflect(-V, N);
-	R.y = max(R.y, 0.015);
-	vec3 reflection = environment(normalize(R));
+	R = normalize(mix(R, N, 0.12));
+	R.y = max(R.y, 0.02);
+	vec3 env_refl = environment(normalize(R));
+	vec4 ssr = vec4(0.0);
+	if (ssr_on > 0.5) ssr = screen_reflection(vs_out.world_position, normalize(R));
+	vec3 reflection = mix(env_refl, ssr.rgb, ssr.a * 0.85);
+	reflection = mix(reflection, mat_a.rgb * 1.6, 0.12); // a hint of the water body
 	vec3 color = mix(beneath, reflection, fresnel);
 
 	// sun highlight : a tight GGX lobe, widened with distance so the far water
@@ -204,7 +357,7 @@ void main()
 		float G = geometry_smith(NdotV, NdotL, sun_rough);
 		vec3 F = fresnel_schlick(max(dot(H, V), 0.0), vec3(0.02));
 		vec3 specular = NDF * G * F / (4.0 * NdotV * NdotL + 1e-6);
-		color += specular * sun_color * sun_power * NdotL;
+		color += specular * sun_color * sun_power * NdotL * sun_water;
 	}
 
 	// moonlight : the same lobe, cool and much weaker
@@ -218,7 +371,7 @@ void main()
 		float Gm = geometry_smith(NdotV, NdotLm, max(mat_b.r, 0.09));
 		vec3 Fm = fresnel_schlick(max(dot(Hm, V), 0.0), vec3(0.02));
 		vec3 specularm = NDFm * Gm * Fm / (4.0 * NdotV * NdotLm + 1e-6);
-		color += specularm * moon_color * moon_power * NdotLm;
+		color += specularm * moon_color * moon_power * NdotLm * sun_water;
 	}
 
 	// subsurface scattering : light entering a crest scatters forward through the
@@ -232,16 +385,16 @@ void main()
 	// still carries a little light from the side and above
 	float backlight = pow(clamp(dot(V, sun_direction) * 0.5 + 0.5, 0.0, 1.0), 2.0);
 	float sss = peak * backlight * (1.0 - fresnel) * water_sss;
-	vec3 sss_tint = vec3(0.012, 0.18, 0.17);
-	color += sss_tint * (sun_color * sun_power * 0.8 + ambient_up * 1.5) * sss;
+	vec3 sss_tint = mat_a.rgb * 1.2 + vec3(0.005, 0.02, 0.03);
+	color += sss_tint * (sun_color * sun_power * 0.55 + ambient_up * 0.8) * sss;
 
 	// foam : simulated crests, a breaking band where the water is shallow, and a
 	// public-domain lace mask so the whitewater has structure instead of a flat
 	// blob. two scales drift at different speeds to break up the tiling
 	vec2 foam_uv = vs_out.world_position.xz / 7.0;
-	float lace_a = texture(foam_pattern, foam_uv + vec2(water_time * 0.008, water_time * 0.003)).r;
-	float lace_b = texture(foam_pattern, foam_uv * 1.73 + vec2(-water_time * 0.012, water_time * 0.005)).r;
-	float lace = smoothstep(0.15, 0.75, lace_a * 0.65 + lace_b * 0.35);
+	float lace_a = cloud_fbm(foam_uv * 2.3 + vec2(water_time * 0.008, water_time * 0.003));
+	float lace_b = cloud_fbm(foam_uv * 4.1 + vec2(-water_time * 0.012, water_time * 0.005));
+	float lace = smoothstep(0.35, 0.75, lace_a * 0.65 + lace_b * 0.35);
 
 	float foam = 0.0;
 	if (mat_b.a > 0.5)
@@ -251,13 +404,19 @@ void main()
 	// and back, and a steep bottom (rock, wall, reef) pulls more whitewater
 	vec3 bottom_n = texture(scene_normal, screen_uv).rgb;
 	float bottom_slope = 1.0 - clamp(normalize(bottom_n + vec3(0.0, 1e-4, 0.0)).y, 0.0, 1.0);
-	float shore_width = 0.35 + 1.8 * crest;
+	float shore_width = 0.18 + 1.4 * crest;
 	float shore = 1.0 - smoothstep(0.0, shore_width, thickness);
 	float runup = 0.72 + 0.28 * sin(water_time * 1.15 + vs_out.world_position.x * 0.17
 	                              + vs_out.world_position.z * 0.11);
 	shore *= runup;
-	float breakers = shore * (0.25 + 0.75 * crest) * (0.55 + 0.90 * bottom_slope);
+	float breakers = shore * (0.25 + 0.75 * crest) * (0.55 + 0.90 * bottom_slope) * shore_foam;
 	foam = max(foam, breakers);
+
+	// a thin bright contact line where the water meets the shore : the depth
+	// buffer is almost exactly at the surface there, so this rings the pool and
+	// every beach with a crisp edge
+	float edge = 1.0 - smoothstep(0.0, 0.05, thickness);
+	foam = max(foam, edge * 0.60 * shore_foam);
 
 	foam *= mix(0.35, 1.15, lace);
 	foam = clamp(foam, 0.0, 1.0);

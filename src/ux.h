@@ -144,16 +144,63 @@ static void draw_log_entry(const Log_Entry& entry)
    ImGui::TextColored(message_colors[severity], "[%s]", entry.text);
 }
 
-// ---------------- tab 1 : System ----------------
-void draw_SYSTEM_console(GameWindow* window)
+// ---- shared timing table : every phase the frame loop instruments ----------
+static void draw_phase_table(GameWindow* window)
 {
    using namespace CNSL;
 
-   if (ImGui::BeginTabItem("System"))
+   const struct { const char* name; float ms; } phases[] = {
+      { "update",  window->phase_update_ms },
+      { "shadow",  window->phase_shadow_ms },
+      { "g-buffer",window->phase_gbuf_ms   },
+      { "lighting",window->phase_light_ms  },
+      { "clouds",  window->phase_cloud_ms  },
+      { "water",   window->phase_water_ms  },
+      { "post",    window->phase_post_ms   },
+      { "ui",      window->phase_ui_ms     },
+   };
+   const uint count = sizeof(phases) / sizeof(phases[0]);
+   float total = window->frame_ms_work > 0.f ? window->frame_ms_work : 1.f;
+
+   if (ImGui::BeginTable("phasetimes", 3, TABLE_FLAGS))
    {
-      // only failures speak : a healthy launch is one line, not three badges
+      ImGui::TableSetupColumn("phase", ImGuiTableColumnFlags_WidthFixed, ui(74));
+      ImGui::TableSetupColumn("ms",    ImGuiTableColumnFlags_WidthFixed, ui(54));
+      ImGui::TableSetupColumn("share", ImGuiTableColumnFlags_WidthFixed, ui(72));
+      ImGui::TableHeadersRow();
+
+      for (uint i = 0; i < count; i++)
+      {
+         float share = phases[i].ms / total;
+         if (share < 0.f) share = 0.f;
+         if (share > 1.f) share = 1.f;
+
+         ImGui::TableNextRow();
+         ImGui::TableNextColumn(); ImGui::Text("%s", phases[i].name);
+         ImGui::TableNextColumn(); ImGui::TextColored(data_color, "%.2f", phases[i].ms);
+         ImGui::TableNextColumn();
+         ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+            share > .50f ? severity_colors[FIXME] : ImVec4(.58f, .72f, .82f, 1.f));
+         ImGui::ProgressBar(share, ImVec2(-1, ui(10)), "");
+         ImGui::PopStyleColor();
+      }
+      ImGui::EndTable();
+   }
+}
+
+// ---------------- tab 1 : Overview ----------------
+// the page to open first : health, frame budget, scene scale and the one-line
+// memory picture, with every deeper number one tab away
+void draw_OVERVIEW_console(GameWindow* window, GameRenderer* rndr, SceneManager* scenes, Scene* scene)
+{
+   using namespace CNSL;
+   const float mb = 1024.f * 1024.f;
+
+   if (ImGui::BeginTabItem("Home"))
+   {
       section("Status");
-      if (window->gl.glew_ok && window->audio.ok && window->gl_errors.total == 0)
+      bool clean = window->gl.glew_ok && window->audio.ok && window->gl_errors.total == 0;
+      if (clean)
          ImGui::TextColored(severity_colors[SUCCESS], "all good");
       else
       {
@@ -166,22 +213,65 @@ void draw_SYSTEM_console(GameWindow* window)
                "%u gl errors (%u last frame)", window->gl_errors.total, window->gl_errors.this_frame);
       }
 
-      if (window->gl_errors.total) // only worth naming when there is one
-         kv("last error", "0x%04X (%s)", window->gl_errors.last_code,
-            gl_error_name(window->gl_errors.last_code));
+      section("Frame");
+      if (window->frame_ms_last > 0.f)
+      {
+         float fps = 1000.f / window->frame_ms_last;
+         ImVec4 fps_color = (fps >= 60) ? severity_colors[SUCCESS]
+            : (fps >= 30) ? severity_colors[WARNING]
+            : severity_colors[FIXME];
+
+         ImGui::SetWindowFontScale(1.7f);
+         ImGui::TextColored(fps_color, "%.0f fps", fps);
+         ImGui::SetWindowFontScale(1.0f);
+         ImGui::SameLine(0, ui(12));
+         ImGui::Text("| %.2f ms   work %.2f ms   target %.2f ms",
+            window->frame_ms_last, window->frame_ms_work, window->frame_milliseconds_target);
+
+         kv("history", "avg %.1f   min %.1f   max %.1f ms",
+            window->frame_ms_avg, window->frame_ms_min, window->frame_ms_max);
+
+         if (window->frame_ms_count > 1)
+            ImGui::PlotLines("##framems", window->frame_ms, (int)window->frame_ms_count, 0,
+               NULL, 0.f, 33.f, ImVec2(ImGui::GetContentRegionAvail().x, ui(54)));
+
+         float used = window->frame_milliseconds_target > 0.f
+            ? window->frame_ms_work / window->frame_milliseconds_target : 0.f;
+         if (used > 1.f) used = 1.f;
+         char budget[48];
+         snprintf(budget, 48, "budget : %.1f / %.1f ms", window->frame_ms_work,
+            window->frame_milliseconds_target);
+         ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+            (used >= 1.f) ? ImVec4(0.82f, 0.50f, 0.44f, 1.f) : ImVec4(0.58f, 0.72f, 0.82f, 1.f));
+         ImGui::ProgressBar(used, ImVec2(-1, 0), budget);
+         ImGui::PopStyleColor();
+
+         section("Where the time goes");
+         draw_phase_table(window);
+      }
+
+      section("Scene");
+      kv("active", "%s", SceneManager::label(scenes->current_kind));
+      kv("world", "%u chunks  |  %u faces  |  %u props",
+         scene->world.num_chunks, scene->world.faces, scene->num_props);
+      kv("render", "%u draws  |  %u meshes  |  %u instances",
+         rndr->stats.draw_calls, rndr->stats.meshes_drawn, rndr->stats.instances);
+      kv("geometry", "%u tris  |  %u verts", rndr->stats.triangles, rndr->stats.vertices);
+      kv("lights", "%u local", scene->num_lights);
+
+      section("Memory");
+      Gpu_Memory m = gpu_memory(window);
+      kv("targets", "%.1f MB  (g-buffer %.0f, lit %.0f, cloud %.0f, noise %.1f)",
+         m.targets() / mb, m.gbuffer / mb, m.lit / mb, m.cloud / mb, m.noise / mb);
+      kv("geometry", "%.1f MB gpu buffers", rndr->geometry_bytes() / mb);
+      kv("shadow", "%.1f MB", rndr->shadow_bytes() / mb);
+      kv("textures", "%.2f MB", rndr->txloader.memory_bytes() / mb);
+      kv("process", "%.0f MB working set", process_memory_bytes() / mb);
 
       section("Context");
       kv("renderer", "%s", window->gl.renderer);
-      kv("vendor", "%s", window->gl.vendor);
       kv("version", "%s (GLSL %s)", window->gl.version, window->gl.glsl_version);
       kv("window", "%d x %d, not resizable", window->screen_width, window->screen_height);
-      kv("frame cap", "120 fps, vsync on");
-      kv("audio", "%s", window->audio.ok ? window->audio.device : "none");
-
-      section("Limits");
-      kv("texture size", "%d", window->gl.max_texture_size);
-      kv("attribs", "%d", window->gl.max_vertex_attribs);
-      kv("uniform floats", "%d", window->gl.max_uniform_components);
 
       ImGui::EndTabItem();
    }
@@ -192,7 +282,7 @@ void draw_SCENES_console(SceneManager* scenes)
 {
    using namespace CNSL;
 
-   if (ImGui::BeginTabItem("Scenes"))
+   if (ImGui::BeginTabItem("Scene"))
    {
       section("Scene");
       kv("active", "%s", SceneManager::label(scenes->current_kind));
@@ -241,8 +331,8 @@ static void draw_gbuffer_panel(GameWindow* window)
       "normal   [RGBA16F]  nrm+roughness",
       "albedo   [RGBA8]    color+AO",
       "depth    [DEPTH24]",
-      "lit      [RGBA16F]  linear HDR",
-      "copy     [RGBA16F]  under the water",
+      "lit      [RGBA32F]  linear HDR",
+      "copy     [RGBA32F]  under the water",
    };
    GLuint gbuf_tex[6] = {
       window->gbuf.rendertarget.position_tx,
@@ -303,61 +393,17 @@ static void draw_texture_panel(GameRenderer* rndr)
 
 // ---- render tab panels : one function per concern, so the tab reads as a list --------
 
-// frame timing : the headline number, the history plot and the work budget
-static void draw_frame_panel(GameWindow* window)
-{
-   using namespace CNSL;
-
-   section("Frame");
-
-   if (window->frame_ms_count == 0) return; // not very first frame
-
-   float fps = (window->frame_ms_last > 0) ? (1000.f / window->frame_ms_last) : 0;
-   ImVec4 fps_color = (fps >= 60) ? severity_colors[SUCCESS]
-      : (fps >= 30) ? severity_colors[WARNING]
-      : severity_colors[FIXME];
-
-   // the headline number, detail beside it
-   ImGui::SetWindowFontScale(1.7f);
-   ImGui::TextColored(fps_color, "%.0f fps", fps);
-   ImGui::SetWindowFontScale(1.0f);
-   ImGui::SameLine(0, ui(12));
-   ImGui::Text("| %.2f ms   target 8.33 ms", window->frame_ms_last);
-
-   if (window->frame_ms_count > 1)
-      ImGui::PlotLines("##framems", window->frame_ms, (int)window->frame_ms_count, 0,
-         NULL, 0.f, 33.f, ImVec2(ImGui::GetContentRegionAvail().x, ui(64)));
-         // ^ explicit width : PlotLines does not accept -1
-
-   kv("history", "avg %.1f   min %.1f   max %.1f ms",
-      window->frame_ms_avg, window->frame_ms_min, window->frame_ms_max);
-
-   // how much of the work budget this frame used (clamped: ImGui asserts fraction <= 1)
-   float target = window->frame_milliseconds_target;
-   float used = (target > 0) ? (window->frame_ms_work / target) : 0;
-   if (used > 1.f) used = 1.f;
-   char budget[48];
-   snprintf(budget, 48, "budget : %.1f / %.1f ms", window->frame_ms_work, target);
-   ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
-      (used >= 1.f) ? ImVec4(0.82f, 0.50f, 0.44f, 1.f) : ImVec4(0.58f, 0.72f, 0.82f, 1.f));
-   ImGui::ProgressBar(used, ImVec2(-1, 0), budget);
-   ImGui::PopStyleColor();
-
-   kv("work / wait", "%.1f ms  /  %.1f ms",
-      window->frame_ms_work, window->frame_ms_last - window->frame_ms_work);
-}
-
 // what the renderer submitted this frame, as GameRenderer::draw tallies it
 static void draw_drawstats_panel(GameRenderer* rndr)
 {
    using namespace CNSL;
 
-   // instances/vertices-per-mesh live in the table's total row : no repeat here,
-   // but the *instanced* vertex count is its own number and stays
    section("Draw Stats");
-   kv("calls", "%u  (%u geometry + lighting)", rndr->stats.draw_calls + 1, rndr->stats.draw_calls);
+   kv("calls", "%u scene submits", rndr->stats.draw_calls);
    kv("meshes", "%u / %d", rndr->stats.meshes_drawn, MAX_MESHES);
+   kv("instances", "%u", rndr->stats.instances);
    kv("tris", "%u  |  %u verts drawn", rndr->stats.triangles, rndr->stats.vertices);
+   kv("batching", "flat colour = 1 multi-draw + explicit props");
 }
 
 // per-mesh draw list : proof each append_instances() landed. one row per mesh, the four
@@ -466,15 +512,17 @@ static void draw_gpubuffers_panel(GameRenderer* rndr)
          DrawBuffer& db = rndr->buffer(m);
 
          ImGui::TableNextRow();
+         uint capacity = db.max_buffer_size + db.max_indx_size + MegaByte(16);
+
          ImGui::TableNextColumn(); ImGui::Text("%s", DRAW_MODE_INFO[m].name);
-         ImGui::TableNextColumn(); ImGui::Text("%.1f", db.geom_size / 1024.f);
-         ImGui::TableNextColumn(); ImGui::Text("%.1f", db.indx_size / 1024.f);
-         ImGui::TableNextColumn(); ImGui::Text("%.1f", db.inst_size / 1024.f);
+         ImGui::TableNextColumn(); ImGui::Text("%.1f / %.0f", db.geom_size / 1024.f, db.max_buffer_size / 1024.f);
+         ImGui::TableNextColumn(); ImGui::Text("%.1f / %.0f", db.indx_size / 1024.f, db.max_indx_size / 1024.f);
+         ImGui::TableNextColumn(); ImGui::Text("%.1f / 16384", db.inst_size / 1024.f);
          ImGui::TableNextColumn(); ImGui::Text("%.1f / %.0f",
-            (db.geom_size + db.indx_size + db.inst_size) / 1024.f, db.max_buffer_size / 1024.f);
+            (db.geom_size + db.indx_size + db.inst_size) / 1024.f, capacity / 1024.f);
 
          used     += db.geom_size + db.indx_size + db.inst_size;
-         reserved += db.max_buffer_size * 3;
+         reserved += capacity;
       }
 
       // every mode reserves geometry, index and instance space, so the floor is three
@@ -517,14 +565,202 @@ static void draw_camera_panel(GameWindow* window, Camera* camera)
       window->keys.S.is_pressed, window->keys.D.is_pressed);
 }
 
-void draw_RENDER_console(GameRenderer* rndr, GameWindow* window, Camera* camera)
+static void draw_graphics_panel(GameWindow* window, Scene* scene)
+{
+   using namespace CNSL;
+
+   section("Quality & Pipeline");
+
+   int preset = window->quality_preset;
+   if (ImGui::Combo("quality", &preset, RENDER_QUALITY_NAMES, 4))
+      render_quality_apply(window, preset);
+
+   ImGui::Checkbox("shadows", &window->render_shadows);
+   ImGui::SameLine();
+   ImGui::Checkbox("volumetric clouds", &window->render_clouds);
+   ImGui::Checkbox("god rays", &window->render_godrays);
+   ImGui::SameLine();
+   ImGui::Checkbox("screen-space reflections", &window->render_ssr);
+   ImGui::Checkbox("SSAO", &window->render_ssao);
+   ImGui::SameLine();
+   ImGui::Checkbox("performance overlay", &window->perf_overlay);
+
+   ImGui::SliderFloat("bloom", &window->bloom_strength, 0.f, .30f, "%.3f");
+   ImGui::SliderInt("cloud steps", &window->cloud_steps, 8, 128);
+   ImGui::SliderInt("SSR steps", &window->ssr_steps, 0, 24);
+   ImGui::SliderInt("god ray steps", &window->godray_steps, 0, 24);
+
+   section("Weather");
+   ImGui::SliderFloat("cloud weather", &scene->lighting.cloud_weather, 0.f, 1.f, "%.2f");
+   ImGui::SliderFloat("AO strength", &scene->lighting.ao_strength, 0.f, 3.f, "%.2f");
+}
+
+// ---------------- tab : Compute ----------------
+// the one GPU compute job in the engine : a one-time bake of the tileable cloud
+// noise volume. everything here is either a constant of that bake or its cost
+void draw_COMPUTE_console(GameWindow* window, Scene* scene)
+{
+   using namespace CNSL;
+   const float mb = 1024.f * 1024.f;
+
+   if (ImGui::BeginTabItem("Compute"))
+   {
+      int size = window->cloud_noise_size;
+      int groups = size / 8;
+      float noise_mb = (float)((size_t)size * size * size * 8u) / mb;
+
+      section("Cloud Noise Bake");
+      kv("program", "%s", window->cloud_noise_shader.link_status ? "LINKED" : "FAILED - see Console");
+      kv("texture", "%d^3 RGBA16F, tileable", size);
+      kv("payload", "%.1f MB", noise_mb);
+      kv("workgroup", "8 x 8 x 8 = %d invocations", 8 * 8 * 8);
+      kv("dispatch", "%d x %d x %d = %d groups", groups, groups, groups,
+         groups * groups * groups);
+      kv("bake", "%.2f ms, once at startup", window->cloud_noise_ms);
+      kv("channels", "R shape | G detail | B mask | A warp");
+
+      ImGui::TextDisabled("the bake replaces per-step procedural fbm in the cloud march;");
+      ImGui::TextDisabled("the volume is sampled with linear filtering and repeat wrap.");
+
+      section("Volumetric Clouds");
+      kv("sampling", "sampler3D, unit 1, full resolution");
+      kv("march", "%d steps", window->cloud_steps);
+      kv("frame cost", "%.2f ms cpu submit", window->phase_cloud_ms);
+      ImGui::SliderInt("cloud steps", &window->cloud_steps, 8, 128);
+      ImGui::SliderFloat("cloud weather", &scene->lighting.cloud_weather, 0.f, 1.f, "%.2f");
+
+      section("Compute Budget");
+      kv("dispatches", "%d, all at startup", 1);
+      kv("readback", "none : the volume stays on the gpu");
+      kv("steady-state", "0 dispatches per frame");
+
+      ImGui::EndTabItem();
+   }
+}
+
+// ---------------- tab : Threads ----------------
+// the water FFT is the only CPU job big enough to split. this tab reports the
+// pool, the split cost and where the rest of the update time went
+void draw_THREADS_console(GameWindow* window, Scene* scene)
+{
+   using namespace CNSL;
+
+   if (ImGui::BeginTabItem("Threads"))
+   {
+      section("Worker Pool");
+      kv("hardware", "%u logical threads", fluid_hardware_threads());
+      kv("workers", "%d active (capped at 8)", fluid_active_threads());
+      kv("model", "spawn / split rows / join, no queue");
+
+      bool parallel = fluid_parallel_enabled;
+      if (ImGui::Checkbox("parallel water FFT", &parallel))
+         fluid_parallel_enabled = parallel;
+      ImGui::TextDisabled("off : every row FFT runs on the main thread");
+
+      section("Water Update");
+      if (scene->water.n > 1)
+      {
+         kv("ocean grid", "%d x %d", scene->water.n, scene->water.n);
+         kv("water_update", "%.2f ms", scene->water.update_ms);
+         kv("inverse fft", "%.2f ms  (%.0f%% of update)",
+            fluid_fft_ms,
+            scene->water.update_ms > 0.f ? 100.f * fluid_fft_ms / scene->water.update_ms : 0.f);
+      }
+      else
+         kv("ocean grid", "not in this scene");
+
+      if (scene->shallow.n > 1)
+      {
+         kv("shallow grid", "%d x %d", scene->shallow.n, scene->shallow.n);
+         kv("shallow_update", "%.2f ms  (%s)",
+            scene->shallow.update_ms, scene->shallow.stepped ? "stepped" : "idle");
+      }
+
+      kv("scene update", "%.2f ms total", window->phase_update_ms);
+
+      section("Frame Phases");
+      draw_phase_table(window);
+
+      ImGui::EndTabItem();
+   }
+}
+
+// ---------------- tab : Memory ----------------
+// every allocation the renderer owns, itemised. geometry and targets are the two
+// large blocks; the process working set is the whole-process number beside them
+void draw_MEMORY_console(GameWindow* window, GameRenderer* rndr)
+{
+   using namespace CNSL;
+   const float mb = 1024.f * 1024.f;
+
+   if (ImGui::BeginTabItem("Memory"))
+   {
+      Gpu_Memory m = gpu_memory(window);
+
+      section("Render Targets");
+      if (ImGui::BeginTable("targetmem", 3, TABLE_FLAGS))
+      {
+         ImGui::TableSetupColumn("target", ImGuiTableColumnFlags_WidthFixed, ui(132));
+         ImGui::TableSetupColumn("format", ImGuiTableColumnFlags_WidthFixed, ui(210));
+         ImGui::TableSetupColumn("MB",     ImGuiTableColumnFlags_WidthFixed, ui(60));
+         ImGui::TableHeadersRow();
+
+         const struct { const char* name; const char* format; size_t bytes; } rows[] = {
+            { "g-buffer",   "pos32f + nrm16f + alb8 + depth24", m.gbuffer },
+            { "lit",        "RGBA32F + depth24",                 m.lit },
+            { "scene copy", "RGBA32F",                           m.scene_copy },
+            { "sky depth",  "depth24",                           m.sky_depth },
+            { "bloom a/b",  "RGBA16F, half res x2",              m.bloom },
+            { "cloud slab", "RGBA16F, full res",                 m.cloud },
+            { "cloud noise","RGBA16F 3D, baked",                 m.noise },
+         };
+
+         for (uint i = 0; i < sizeof(rows) / sizeof(rows[0]); i++)
+         {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::Text("%s", rows[i].name);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", rows[i].format);
+            ImGui::TableNextColumn(); ImGui::TextColored(data_color, "%.1f", rows[i].bytes / mb);
+         }
+
+         ImGui::TableNextRow();
+         ImGui::TableNextColumn(); ImGui::TextColored(severity_colors[TRACE], "total");
+         ImGui::TableNextColumn();
+         ImGui::TableNextColumn(); ImGui::TextColored(severity_colors[TRACE], "%.1f", m.targets() / mb);
+         ImGui::EndTable();
+      }
+
+      section("GPU Geometry");
+      draw_gpubuffers_panel(rndr);
+      kv("instancing", "16 MB reserved per mode");
+      kv("indirect", "%.0f KB command buffer", MAX_MESHES * sizeof(GameRenderer::Draw_Command) / 1024.f);
+
+      section("Shadow + Textures");
+      kv("shadow map", "%u^2 depth24, %.1f MB", rndr->shadow.size, rndr->shadow_bytes() / mb);
+      kv("textures", "%u loaded, %.2f MB",
+         rndr->txloader.num_textures, rndr->txloader.memory_bytes() / mb);
+
+      section("Totals");
+      size_t gpu_total = m.targets() + rndr->geometry_bytes() + rndr->shadow_bytes()
+                       + rndr->txloader.memory_bytes();
+      kv("gpu", "%.1f MB  (targets %.1f | buffers %.1f | shadow %.1f | tex %.1f)",
+         gpu_total / mb, m.targets() / mb, rndr->geometry_bytes() / mb,
+         rndr->shadow_bytes() / mb, rndr->txloader.memory_bytes() / mb);
+      kv("process", "%.0f MB working set", process_memory_bytes() / mb);
+      kv("water grids", "%.1f MB cpu (ocean + shallow state)",
+         (float)(sizeof(Water) + sizeof(Shallow_Water)) / mb);
+
+      ImGui::EndTabItem();
+   }
+}
+
+void draw_RENDER_console(GameRenderer* rndr, GameWindow* window, Camera* camera, Scene* scene)
 {
    if (ImGui::BeginTabItem("Render"))
    {
-      draw_frame_panel(window);
+      draw_graphics_panel(window, scene);
       draw_drawstats_panel(rndr);
       draw_meshdrawlist_panel(rndr);
-      draw_gpubuffers_panel(rndr);
       draw_gbuffer_panel(window);
       draw_camera_panel(window, camera);
 
@@ -584,7 +820,7 @@ void draw_PHYS_console(Physics* phys)
 {
    using namespace CNSL;
 
-   if (ImGui::BeginTabItem("Phys"))
+   if (ImGui::BeginTabItem("Physics"))
    {
       // per-shape identity : chips and table rows share it
       static const char* shape_names[] = { "none", "box", "sphere", "capsule", "cylinder", "cone" };
@@ -899,7 +1135,7 @@ void draw_MAIN_console(GameConsole* console)
    static bool autoscroll = true;
    static char search[64] = {};
 
-   if (ImGui::BeginTabItem("Console"))
+   if (ImGui::BeginTabItem("Log"))
    {
       // ---- row 1 : severity chips with live counts
       for (uint s = 0; s < 5; s++)
@@ -1144,7 +1380,7 @@ static void draw_scene_select(GameWindow* window, SceneManager* scenes)
 	ImGui::End();
 }
 
-static void draw_main_menu(GameWindow* window)
+static void draw_main_menu(GameWindow* window, SceneManager* scenes)
 {
 	float scale = window->screen_height / 1080.f;
 	ImGuiIO& io = ImGui::GetIO();
@@ -1170,6 +1406,7 @@ static void draw_main_menu(GameWindow* window)
 	}
 
 	ImGui::SetWindowFontScale(scale);
+	if (menu_button("play world", scale)) game_start_scene(window, scenes, SCENE_WORLD);
 	if (menu_button("scenes", scale))
 	{
 		game_scene_select_open = true;
@@ -1230,7 +1467,7 @@ void draw_game_menus(GameWindow* window, SceneManager* scenes)
 		return;
 	}
 
-	if (game_screen == GAME_SCREEN_MENU) draw_main_menu(window);
+	if (game_screen == GAME_SCREEN_MENU) draw_main_menu(window, scenes);
 	else if (game_screen == GAME_SCREEN_PAUSED) draw_pause_menu(window, scenes);
 }
 
@@ -1280,10 +1517,13 @@ void draw_console(GameConsole* console, GameRenderer* rndr, GameWindow* window, 
    // nothing runs past the panel edge : overlong lines wrap instead of clipping
    ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - ui(16));
 
-   ImGui::BeginTabBar("Console Tabs", ImGuiTabBarFlags_None);
-   draw_SYSTEM_console(window);
+   ImGui::BeginTabBar("Console Tabs", ImGuiTabBarFlags_FittingPolicyScroll);
+   draw_OVERVIEW_console(window, rndr, scenes, scene);
    draw_SCENES_console(scenes);
-   draw_RENDER_console(rndr, window, &scene->camera);
+   draw_RENDER_console(rndr, window, &scene->camera, scene);
+   draw_COMPUTE_console(window, scene);
+   draw_THREADS_console(window, scene);
+   draw_MEMORY_console(window, rndr);
    draw_DEBUG_console(rndr, scene);
    draw_PHYS_console(&scene->phys);
    draw_PLAYER_console(scene);
@@ -1295,4 +1535,55 @@ void draw_console(GameConsole* console, GameRenderer* rndr, GameWindow* window, 
 
    ImGui::End();
    ImGui::PopStyleVar(); // window rounding
+}
+
+// ---- always-on performance overlay -----------------------------------------
+// compact HUD over the game view : frame, work, phases, draw stats and memory.
+// refreshed every frame, independent of whether the console is open
+void draw_performance_overlay(GameWindow* window, GameRenderer* rndr, Scene* scene)
+{
+   if (!window->perf_overlay) return;
+
+   ImGuiViewport* vp = ImGui::GetMainViewport();
+   ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - 16.f, vp->Pos.y + 16.f),
+                           ImGuiCond_Always, ImVec2(1.f, 0.f));
+   ImGui::SetNextWindowBgAlpha(0.28f);
+   ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                          | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+                          | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs
+                          | ImGuiWindowFlags_AlwaysAutoResize;
+   if (!ImGui::Begin("##perf_overlay", NULL, flags)) { ImGui::End(); return; }
+
+   float fps = window->frame_ms_last > 0.f ? 1000.f / window->frame_ms_last : 0.f;
+   ImVec4 fps_col = fps >= 55.f ? ImVec4(.55f, .85f, .60f, 1.f)
+                   : fps >= 28.f ? ImVec4(.90f, .78f, .45f, 1.f)
+                                  : ImVec4(.90f, .45f, .42f, 1.f);
+   ImGui::TextColored(fps_col, "%.0f fps", fps);
+   ImGui::SameLine();
+   ImGui::Text("| %.2f ms   cpu %.2f ms", window->frame_ms_last, window->frame_ms_work);
+   ImGui::Text("upd %.1f  shd %.1f  gbuf %.1f  lit %.1f  cld %.1f  h2o %.1f  post %.1f  ui %.1f",
+               window->phase_update_ms, window->phase_shadow_ms, window->phase_gbuf_ms,
+               window->phase_light_ms, window->phase_cloud_ms, window->phase_water_ms,
+               window->phase_post_ms, window->phase_ui_ms);
+   ImGui::Text("draws %u  |  inst %u  |  tris %u  |  verts %u",
+               rndr->stats.draw_calls, rndr->stats.instances,
+               rndr->stats.triangles, rndr->stats.vertices);
+
+   const float mb = 1024.f * 1024.f;
+   Gpu_Memory mem = gpu_memory(window);
+   float gpu_mb = (float)(mem.targets() + rndr->geometry_bytes() + rndr->shadow_bytes()
+                        + rndr->txloader.memory_bytes()) / mb;
+   ImGui::Text("gpu %.0f MB  |  targets %.0f  |  tex %.0f  |  proc %.0f",
+               gpu_mb, (float)mem.targets() / mb,
+               (float)rndr->txloader.memory_bytes() / mb, (float)process_memory_bytes() / mb);
+   if (scene->water.n > 1)
+      ImGui::Text("threads %d  |  fft %.2f ms  |  update %.2f ms",
+                  fluid_active_threads(), fluid_fft_ms, window->phase_update_ms);
+   else
+      ImGui::Text("threads %d  |  update %.2f ms",
+                  fluid_active_threads(), window->phase_update_ms);
+   ImGui::Text("lights %u  |  chunks %u  |  faces %u",
+               scene->num_lights, scene->world.num_chunks, scene->world.faces);
+
+   ImGui::End();
 }

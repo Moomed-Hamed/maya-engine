@@ -89,6 +89,7 @@ struct DrawBuffer
 
 	// runtime buffer info
 	uint max_buffer_size;
+	uint max_indx_size; // index buffer is a fraction of the geometry buffer
 	uint num_meshes;
 	uint total_instances; // instances currently stored
 
@@ -102,6 +103,8 @@ struct DrawBuffer
 
 		glGenVertexArrays(1, &vao);
 		max_buffer_size = buffer_size;
+		max_indx_size   = buffer_size / 4;
+		uint inst_size  = MegaByte(16);
 
 		// bind the vao *before* binding anything else!
 		glBindVertexArray(vao);
@@ -125,7 +128,7 @@ struct DrawBuffer
 		uint first_instance_attrib = 3;
 		glGenBuffers(1, &inst_buffer);
 		glBindBuffer(GL_ARRAY_BUFFER, inst_buffer);
-		glBufferData(GL_ARRAY_BUFFER, max_buffer_size, NULL, GL_DYNAMIC_DRAW);
+		glBufferData(GL_ARRAY_BUFFER, inst_size, NULL, GL_DYNAMIC_DRAW);
 		for (uint i = first_instance_attrib; i < first_instance_attrib + 4; i++)
 		{
 			glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, sizeof(Instance), (void*)(sizeof(vec4) * (i - first_instance_attrib)));
@@ -142,7 +145,7 @@ struct DrawBuffer
 		// index buffer : ordered uints referencing the vertices
 		glGenBuffers(1, &indx_buffer);
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indx_buffer);
-		glBufferData(GL_ELEMENT_ARRAY_BUFFER, max_buffer_size, NULL, GL_STATIC_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, max_indx_size, NULL, GL_STATIC_DRAW);
 
 		char msg[MAX_LOG_MSG_LENGTH] = {};
 		snprintf(msg, MAX_LOG_MSG_LENGTH, "Init DrawBuffer [%s] | Size : [%d]", info.name, max_buffer_size);
@@ -172,10 +175,10 @@ struct DrawBuffer
 			console->add_entry(msg, FIXME, RNDR);
 			return false; // don't write past the gpu buffer
 		}
-		if (indx_size + index_bytes > max_buffer_size) {
+		if (indx_size + index_bytes > max_indx_size) {
 			char msg[MAX_LOG_MSG_LENGTH];
 			snprintf(msg, MAX_LOG_MSG_LENGTH, "Index buffer full [%s]! [%d + %d > %d bytes]",
-				DRAW_MODE_INFO[mode].name, indx_size, index_bytes, max_buffer_size);
+				DRAW_MODE_INFO[mode].name, indx_size, index_bytes, max_indx_size);
 			console->add_entry(msg, FIXME, RNDR);
 			return false;
 		}
@@ -204,6 +207,33 @@ struct DrawBuffer
 		indx_size += index_bytes;
 
 		return true;
+	}
+
+	// reserve a run of mesh_info entries for a subsystem that manages its own
+	// byte ranges (the voxel chunk arena does). returns the first index or -1
+	int reserve_meshes(uint count)
+	{
+		if (num_meshes + count > MAX_MESHES) return -1;
+		uint first = num_meshes;
+		for (uint i = 0; i < count; i++) mesh_info[first + i] = {};
+		num_meshes += count;
+		return (int)first;
+	}
+
+	// upload into a byte range the caller already owns. the chunk arena packs a
+	// whole chunk into one vertex range and one index range, then points its
+	// per-material mesh entries into them
+	void write_geometry(uint byte_offset, uint num_vertices, const MeshVertexData* verts)
+	{
+		glBindBuffer(GL_ARRAY_BUFFER, geom_buffer);
+		glBufferSubData(GL_ARRAY_BUFFER, byte_offset, num_vertices * sizeof(MeshVertexData), verts);
+	}
+
+	void write_indices(uint byte_offset, uint num_indices, const uint* indices)
+	{
+		glBindVertexArray(vao);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indx_buffer);
+		glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, byte_offset, num_indices * sizeof(uint), indices);
 	}
 
 	// modes 1 and 3 : positions, normals, uvs
@@ -282,7 +312,16 @@ struct DrawBuffer
 		glDeleteBuffers(1, &indx_buffer);
 		glDeleteBuffers(1, &inst_buffer);
 		glDeleteVertexArrays(1, &vao);
-		*this = {};
+
+		// do not use *this = {} here : the mesh_info array is megabytes and a
+		// temporary of the whole struct overflows the stack once MAX_MESHES grows
+		for (uint i = 0; i < MAX_MESHES; i++) mesh_info[i] = {};
+		geom_buffer = indx_buffer = inst_buffer = vao = 0;
+		max_buffer_size = 0;
+		max_indx_size = 0;
+		num_meshes = 0;
+		total_instances = 0;
+		geom_size = indx_size = inst_size = 0;
 	}
 
 	// drop every mesh and refill with empty buffers of the same size
@@ -310,7 +349,8 @@ struct DrawList
 
 	void update(DrawBuffer* db)
 	{
-		*this = {}; // zero memory
+		memset(meshlist, 0, sizeof(meshlist));
+		memset(mesh_params, 0, sizeof(mesh_params));
 
 		for (uint i = 0; i < MAX_MESHES; i++)
 		{
@@ -628,10 +668,23 @@ struct GameRenderer
 		uint vertices;
 	} stats;
 
+	// one draw call for every mesh in a texture group. the command list lives in
+	// system memory and is uploaded once per pass
+	struct Draw_Command
+	{
+		uint count;
+		uint instance_count;
+		uint first_index;
+		uint base_vertex;
+		uint base_instance;
+	};
+	GLuint indirect_buffer;
+	Draw_Command indirect_cmds[MAX_MESHES];
+
 	// asset loading
 	uint          next_mesh_id; // mesh ids for generated geometry
+	uint          no_shadow_mesh; // view-model mesh excluded from the sun depth pass
 	TextureLoader txloader;
-	uint          foam_pattern_tx; // CC0 lace mask, shared by every water surface
 	ShaderProgram shaders[2]; // 0 = static meshes, 1 = forward water
 
 	// drawing : one buffer and one draw list per mode. the table is the only list of
@@ -671,19 +724,43 @@ struct GameRenderer
 
 	DrawBuffer& buffer(uint mode) { return drawbuffers[mode]; }
 
+	// allocated storage, split so the Memory tab can itemise it. render targets
+	// are accounted for by GameWindow
+	size_t geometry_bytes() const
+	{
+		size_t bytes = 0;
+		for (uint m = 0; m < DRAW_MODE_COUNT; m++)
+			bytes += (size_t)drawbuffers[m].max_buffer_size
+			       + (size_t)drawbuffers[m].max_indx_size
+			       + (size_t)MegaByte(16); // instance buffer is a fixed 16 MB
+		bytes += (size_t)MAX_LIGHTS * sizeof(LightInstance);
+		return bytes;
+	}
+
+	size_t shadow_bytes() const
+	{
+		return (size_t)shadow.size * (size_t)shadow.size * 3u; // depth24
+	}
+
 	void init()
 	{
 		shaders[0].create("assets/shaders/geom.vert", "assets/shaders/geom.frag");
 		shaders[1].create("assets/shaders/water.vert", "assets/shaders/water.frag");
+		no_shadow_mesh = 0;
 
-		for (uint mode = 0; mode < DRAW_MODE_COUNT; mode++)
-			drawbuffers[mode].init(MegaByte(8), mode);
+		// the voxel world is one static mesh set : it needs more geometry room than
+		// the small prop scenes, while water stays at its original size
+		drawbuffers[MODE_STATIC_UV].init(MegaByte(256), MODE_STATIC_UV);
+		drawbuffers[MODE_WATER].init(MegaByte(8), MODE_WATER);
 
 		init_light_volumes();
 		init_shadow();
 
+		glGenBuffers(1, &indirect_buffer);
+		glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect_buffer);
+		glBufferData(GL_DRAW_INDIRECT_BUFFER, MAX_MESHES * sizeof(Draw_Command), NULL, GL_DYNAMIC_DRAW);
+
 		txloader.init();
-		foam_pattern_tx = txloader.load("assets/textures/foam_pattern.jpg");
 		debug_draw.init();
 		debug_draw.mark_static();
 
@@ -737,7 +814,7 @@ struct GameRenderer
 	// the camera, so it follows the scene instead of matching one fixed map
 	void init_shadow()
 	{
-		shadow.size = 2048;
+		shadow.size = 4096;
 		shadow.enabled = true;
 		shadow.shader.create("assets/shaders/shadow.vert", "assets/shaders/shadow.frag");
 
@@ -824,15 +901,11 @@ struct GameRenderer
 			glBindVertexArray(db.vao);
 			drawlists[mode].update(&db);
 
-			for (uint i = 0; i < MAX_MESHES; i++)
-			{
-				auto& mp = drawlists[mode].mesh_params[i];
-				if (mp.num_instances == 0) continue;
-
-				glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, mp.num_indices,
-					GL_UNSIGNED_INT, (void*)mp.base_index, mp.num_instances,
-					mp.base_vertex, mp.base_instance);
-			}
+			// depth only : every mesh can share one multi-draw, textured or not
+			uint n = build_indirect(&drawlists[mode], &db, true, false, false);
+			if (n)
+				glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, n,
+				                            sizeof(Draw_Command));
 		}
 
 		glEnable(GL_CULL_FACE);
@@ -898,10 +971,10 @@ struct GameRenderer
 			drawbuffers[mode].reset();
 
 		next_mesh_id = 0;
+		no_shadow_mesh = 0;
 		debug_draw.reset_dynamic();
 		txloader.clear();
 		txloader.init();
-		foam_pattern_tx = txloader.load("assets/textures/foam_pattern.jpg");
 
 		stats = {};
 	}
@@ -1047,6 +1120,8 @@ struct GameRenderer
 	// between the surface and the floor
 	void draw_water(GameWindow* window, mat4 proj_view, vec3 view_pos, const Lighting& l)
 	{
+		window->water_proj_view = proj_view;
+		window->water_view_pos = view_pos;
 		DrawBuffer& db = drawbuffers[MODE_WATER];
 		if (db.num_meshes == 0) return;
 
@@ -1080,6 +1155,7 @@ struct GameRenderer
 		ShaderProgram& shader = shaders[DRAW_MODE_INFO[MODE_WATER].shader];
 		shader.bind();
 		shader.set_mat4("proj_view", proj_view);
+		shader.set_mat4("inv_proj_view", glm::inverse(proj_view));
 		shader.set_vec3("view_pos", view_pos);
 		shader.set_float("near_plane", 0.1f); // matches Scene::update's projection
 		shader.set_float("far_plane", window->far_plane);
@@ -1108,14 +1184,19 @@ struct GameRenderer
 
 		shader.set_vec3 ("foam_color", window->water_foam_color);
 		shader.set_float("foam_roughness", window->water_foam_roughness);
+		shader.set_float("shore_foam", window->water_shore_foam);
+		shader.set_float("sun_water", window->water_sun);
 		shader.set_float("water_detail", window->water_detail);
+		shader.set_float("water_chop", window->water_chop);
+		shader.set_vec3("water_absorb", window->water_absorb);
 		shader.set_float("water_sss", window->water_sss);
 		shader.set_float("water_time", window->water_time);
+		shader.set_float("ssr_on", window->render_ssr ? 1.f : 0.f);
+		shader.set_int("ssr_steps", window->ssr_steps);
 
 		glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, window->hdr.scene_copy.color_tx);
 		glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, window->gbuf.rendertarget.depth_tx);
 		glActiveTexture(GL_TEXTURE3); txloader.bind(window->water_normal_tx, 3);
-		glActiveTexture(GL_TEXTURE4); txloader.bind(foam_pattern_tx, 4);
 		glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, window->gbuf.rendertarget.normal_tx);
 		glActiveTexture(GL_TEXTURE0);
 
@@ -1128,15 +1209,68 @@ struct GameRenderer
 		glDepthFunc(GL_LESS);
 	}
 
+	// pack a draw list into the indirect command buffer. the flat-colour group
+	// (tx 0) is the whole voxel world, so one multi-draw collapses every chunk
+	// mesh into a single API call. returns the number of commands written.
+	uint build_indirect(DrawList* dl, DrawBuffer* db, bool skip_no_shadow,
+	                    bool only_flat, bool tally)
+	{
+		uint n = 0;
+		for (uint i = 0; i < MAX_MESHES; i++)
+		{
+			if (dl->meshlist[i] == 0) continue;
+			if (skip_no_shadow && dl->meshlist[i] == no_shadow_mesh) continue;
+			if (only_flat && db->mesh_info[i].tx_id != 0) continue;
+
+			auto& mp = dl->mesh_params[i];
+			if (mp.num_instances == 0) continue;
+
+			Draw_Command& c = indirect_cmds[n++];
+			c.count          = mp.num_indices;
+			c.instance_count = mp.num_instances;
+			c.first_index    = mp.base_index / sizeof(uint);
+			c.base_vertex    = mp.base_vertex;
+			c.base_instance  = mp.base_instance;
+
+			if (tally)
+			{
+				stats.instances += mp.num_instances;
+				stats.triangles += (mp.num_indices / 3) * mp.num_instances;
+				stats.vertices  += db->mesh_info[i].num_vertices * mp.num_instances;
+			}
+		}
+
+		if (n)
+		{
+			glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect_buffer);
+			glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, n * sizeof(Draw_Command), indirect_cmds);
+		}
+		return n;
+	}
+
 	// issue the instanced draw calls for one buffer, tallying stats
 	void draw_pass(DrawBuffer* db, DrawList* dl)
 	{
-		uint bound_tx = (uint)-1; // rebind only when the mesh draws with a different texture
+		// flat-colour voxel chunks : one indirect multi-draw
+		uint n = build_indirect(dl, db, false, true, true);
+		if (n)
+		{
+			txloader.bind(0);
+			glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, n,
+			                            sizeof(Draw_Command));
+			stats.draw_calls++;
+			stats.meshes_drawn += n;
+		}
 
+		// textured props are few and can interleave textures : keep them explicit
+		uint bound_tx = (uint)-1;
 		for (uint i = 0; i < MAX_MESHES; i++)
 		{
-			if (dl->meshlist[i] == 0)
-				continue;
+			if (dl->meshlist[i] == 0) continue;
+			if (db->mesh_info[i].tx_id == 0) continue;
+
+			auto& mp = dl->mesh_params[i];
+			if (mp.num_instances == 0) continue;
 
 			if (db->mesh_info[i].tx_id != bound_tx)
 			{
@@ -1144,11 +1278,9 @@ struct GameRenderer
 				txloader.bind(bound_tx);
 			}
 
-			auto& mp = dl->mesh_params[i];
 			glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, mp.num_indices, GL_UNSIGNED_INT,
 				(void*)mp.base_index, mp.num_instances, mp.base_vertex, mp.base_instance);
 
-			// record what we just submitted (mesh_info shares this index with mesh_params)
 			stats.draw_calls++;
 			stats.meshes_drawn++;
 			stats.instances  += mp.num_instances;

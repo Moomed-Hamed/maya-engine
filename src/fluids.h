@@ -1,4 +1,5 @@
 #include "player.h"
+#include <thread>
 
 /* ------------------------- *
 	-        Fluids         -
@@ -37,14 +38,14 @@ struct Water_Config
 	float amplitude  = .55f; // rms height, metres
 	float choppiness = .95f; // horizontal displacement scale
 	float time_scale = .88f;
-	float foam       = .35f; // foam source amount, 0..1
+	float foam       = .22f; // foam source amount, 0..1
 	float foam_persistence = 1.6f; // seconds a trail survives
 	float detail     = .68f; // short-chop normal strength
 	uint  seed       = 7;
 
 	// material
-	vec3  albedo        = vec3(.020f, .160f, .185f);
-	float roughness     = .055f;
+	vec3  albedo        = vec3(.040f, .120f, .230f);
+	float roughness     = .110f;
 	float sss           = .72f; // backlit crest glow
 	vec3  foam_albedo   = vec3(.80f, .87f, .89f);
 	float foam_roughness = .50f;
@@ -73,6 +74,7 @@ struct Water
 	float size;
 	float time;
 	bool  paused;
+	float update_ms; // last water_update wall time
 
 	// spectrum : h0(k) and conj(h0(-k)), then one evolved field at a time
 	Water_Complex h0    [WATER_MAX_N * WATER_MAX_N];
@@ -110,14 +112,14 @@ struct Water_Preset
 
 // name, patch, wind, direction, rms, chop, time, foam amount, persistence, detail, roughness, albedo
 const Water_Preset WATER_PRESETS[] = {
-	{ "glassy",  96.f,  3.f, 0.20f, 0.05f, 0.25f, 0.55f, 0.00f, 0.50f, 0.25f, 0.025f, vec3(.012f, .075f, .100f) },
-	{ "calm",   128.f,  6.f, 0.45f, 0.19f, 0.50f, 0.80f, 0.10f, 1.00f, 0.45f, 0.040f, vec3(.018f, .095f, .125f) },
-	{ "breeze", 160.f,  9.f, 0.60f, 0.43f, 0.80f, 1.00f, 0.45f, 1.80f, 0.65f, 0.060f, vec3(.022f, .120f, .155f) },
-	{ "caribbean", 160.f, 9.f, 0.60f, 0.55f, 0.95f, 0.88f, 0.35f, 1.60f, 0.68f, 0.055f, vec3(.020f, .160f, .185f) },
-	{ "lagoon", 128.f, 6.f, 0.55f, 0.18f, 0.45f, 0.80f, 0.08f, 1.00f, 0.55f, 0.035f, vec3(.030f, .220f, .230f) },
-	{ "swell",  192.f, 13.f, 0.95f, 0.90f, 0.90f, 0.90f, 0.55f, 2.20f, 0.70f, 0.080f, vec3(.020f, .105f, .140f) },
-	{ "chop",   256.f, 16.f, 1.35f, 1.37f, 1.15f, 1.10f, 0.65f, 2.50f, 0.85f, 0.100f, vec3(.018f, .090f, .125f) },
-	{ "storm",  256.f, 20.f, 2.20f, 2.14f, 1.45f, 1.20f, 0.80f, 3.00f, 1.00f, 0.130f, vec3(.012f, .055f, .075f) },
+	{ "glassy",  96.f,  3.f, 0.20f, 0.05f, 0.25f, 0.55f, 0.00f, 0.50f, 0.25f, 0.025f, vec3(.040f, .130f, .210f) },
+	{ "calm",   128.f,  6.f, 0.45f, 0.19f, 0.50f, 0.80f, 0.10f, 1.00f, 0.45f, 0.040f, vec3(.045f, .155f, .235f) },
+	{ "breeze", 160.f,  9.f, 0.60f, 0.43f, 0.80f, 1.00f, 0.45f, 1.80f, 0.65f, 0.060f, vec3(.050f, .170f, .255f) },
+	{ "caribbean", 160.f, 9.f, 0.60f, 0.55f, 0.95f, 0.88f, 0.35f, 1.60f, 0.68f, 0.055f, vec3(.055f, .215f, .275f) },
+	{ "lagoon", 128.f, 6.f, 0.55f, 0.18f, 0.45f, 0.80f, 0.08f, 1.00f, 0.55f, 0.035f, vec3(.060f, .235f, .295f) },
+	{ "swell",  192.f, 13.f, 0.95f, 0.90f, 0.90f, 0.90f, 0.55f, 2.20f, 0.70f, 0.080f, vec3(.045f, .150f, .235f) },
+	{ "chop",   256.f, 16.f, 1.35f, 1.37f, 1.15f, 1.10f, 0.65f, 2.50f, 0.85f, 0.100f, vec3(.040f, .135f, .215f) },
+	{ "storm",  256.f, 20.f, 2.20f, 2.14f, 1.45f, 1.20f, 0.80f, 3.00f, 1.00f, 0.130f, vec3(.032f, .105f, .180f) },
 };
 
 const uint WATER_PRESET_COUNT = sizeof(WATER_PRESETS) / sizeof(WATER_PRESETS[0]);
@@ -140,8 +142,46 @@ void water_apply_preset(Water_Config* c, uint index)
 	c->albedo     = p.albedo;
 }
 
-// ---- FFT ----
+// ---- simple CPU parallelism ------------------------------------------------
+// row/column FFTs are independent, so a tiny fixed worker fan-out is enough.
+// no queue, no lifetime : spawn, split, join. used by the water update.
 
+static bool fluid_parallel_enabled = true;
+static int  fluid_worker_threads   = 1;
+static float fluid_fft_ms          = 0.f; // total inverse-transform time, last update
+
+inline uint fluid_hardware_threads()
+{
+	uint hw = std::thread::hardware_concurrency();
+	return hw == 0 ? 1u : hw;
+}
+
+// workers actually used by the last parallel call
+inline int fluid_active_threads() { return fluid_worker_threads; }
+
+template <typename F>
+void fluid_parallel_rows(uint count, F&& fn)
+{
+	uint threads = fluid_parallel_enabled ? fluid_hardware_threads() : 1u;
+	if (threads > 8u) threads = 8u;
+	if (threads > count) threads = count ? count : 1u;
+	fluid_worker_threads = (int)threads;
+
+	if (threads <= 1)
+	{
+		for (uint i = 0; i < count; i++) fn(i);
+		return;
+	}
+
+	std::thread workers[8];
+	for (uint t = 0; t < threads; t++)
+		workers[t] = std::thread([&, t]() {
+			for (uint i = t; i < count; i += threads) fn(i);
+		});
+	for (uint t = 0; t < threads; t++) workers[t].join();
+}
+
+// ---- FFT ----
 // in-place radix-2 inverse transform, scaled by 1/n
 void water_ifft(Water_Complex* a, uint n)
 {
@@ -179,21 +219,23 @@ void water_ifft(Water_Complex* a, uint n)
 // rows then columns : the 1/n from each pass makes the 2D scale 1/n^2
 void water_ifft2(Water_Complex* data, uint n)
 {
-	Water_Complex line[WATER_MAX_N];
+	double fft_start = glfwGetTime();
 
-	for (uint x = 0; x < n; x++)
-	{
+	fluid_parallel_rows(n, [&](uint x) {
+		Water_Complex line[WATER_MAX_N];
 		for (uint z = 0; z < n; z++) line[z] = data[z * n + x];
 		water_ifft(line, n);
 		for (uint z = 0; z < n; z++) data[z * n + x] = line[z];
-	}
+	});
 
-	for (uint z = 0; z < n; z++)
-	{
+	fluid_parallel_rows(n, [&](uint z) {
+		Water_Complex line[WATER_MAX_N];
 		for (uint x = 0; x < n; x++) line[x] = data[z * n + x];
 		water_ifft(line, n);
 		for (uint x = 0; x < n; x++) data[z * n + x] = line[x];
-	}
+	});
+
+	fluid_fft_ms += (float)((glfwGetTime() - fft_start) * 1000.0);
 }
 
 // ---- spectrum ----
@@ -305,10 +347,13 @@ void water_extract(Water* w, float* out)
 // returns false when paused and nothing forced a recompute
 bool water_update(Water* w, const Water_Config& c, float dt, bool force)
 {
+	double update_start = glfwGetTime();
+	fluid_fft_ms = 0.f;
+
 	if (w->n < 2) force = true;
 	if (w->n < 2) water_build_spectrum(w, c);
 
-	if (w->paused && !force) return false;
+	if (w->paused && !force) { w->update_ms = 0.f; return false; }
 
 	float step = w->paused ? 0.f : dt * c.time_scale;
 	w->time += step;
@@ -438,6 +483,7 @@ bool water_update(Water* w, const Water_Config& c, float dt, bool force)
 		}
 	}
 
+	w->update_ms = (float)((glfwGetTime() - update_start) * 1000.0);
 	return true;
 }
 
@@ -642,6 +688,8 @@ struct Shallow_Water
 	bool  rain;
 	bool  paused;
 	bool  dirty;
+	bool  stepped;       // last update advanced the sim
+	float update_ms;     // last shallow_update wall time
 	uint  rng;
 
 	float a[SHALLOW_MAX_N * SHALLOW_MAX_N];
@@ -803,8 +851,10 @@ void shallow_step(Shallow_Water* w, const Shallow_Config& c, float dt)
 
 bool shallow_update(Shallow_Water* w, const Shallow_Config& c, float dt, bool paused)
 {
-	if (w->n < 2) return false;
-	if (paused) return false;
+	if (w->n < 2) { w->update_ms = 0.f; return false; }
+	if (paused)    { w->update_ms = 0.f; return false; }
+
+	double update_start = glfwGetTime();
 
 	// fixed 120 hz : stable for every speed the slider allows, independent of fps
 	const float fixed_dt = 1.f / 120.f;
@@ -825,6 +875,8 @@ bool shallow_update(Shallow_Water* w, const Shallow_Config& c, float dt, bool pa
 	}
 
 	if (w->accumulator > .10f) w->accumulator = .10f;
+	w->stepped   = stepped;
+	w->update_ms = (float)((glfwGetTime() - update_start) * 1000.0);
 	return stepped;
 }
 

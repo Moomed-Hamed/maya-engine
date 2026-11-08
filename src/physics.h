@@ -2,6 +2,9 @@
 #include "BulletSoftBody/btSoftBodyHelpers.h"
 #include "BulletSoftBody/btSoftBodyRigidBodyCollisionConfiguration.h"
 #include "BulletSoftBody/btDefaultSoftBodySolver.h"
+#include "BulletCollision/CollisionShapes/btTriangleMesh.h"
+#include "BulletCollision/CollisionShapes/btBvhTriangleMeshShape.h"
+#include "BulletCollision/CollisionShapes/btHeightfieldTerrainShape.h"
 
 /* ------------------------- *
 	-       Physics         -
@@ -29,6 +32,7 @@ struct Phys_Body
 	btQuaternion spawn_rot; // pose it was born in : reset restores it
 	vec3 spawn_pos;         // spot it was born in : reset uses it too
 	uint wire_mesh; // 0 = shared unit wire, else a per-body capsule wire
+	float* owned_data; // heightfield samples, owned by the body
 };
 
 // debug wires over the scene : collider shapes, constraint frames and a scene
@@ -193,6 +197,7 @@ struct Physics
 			delete b->getMotionState();
 			delete b->getCollisionShape();
 			delete b;
+			free(bodies[i].owned_data);
 		}
 
 		debug.shutdown();
@@ -280,6 +285,71 @@ struct Physics
 		return slot;
 	}
 
+	// static heightfield : the streaming world uses a local patch around the
+	// player. Bullet centres the height values on the AABB, so lift the body by
+	// the data's mid height and the samples become world y values
+	uint add_heightfield(float* heights, int n, float spacing, vec3 origin,
+	                     float min_h, float max_h)
+	{
+		if (!heights || n < 2)
+		{
+			free(heights);
+			return 0;
+		}
+
+		uint slot = 0;
+		for (uint i = 1; i < num_bodies; i++)
+			if (!bodies[i].body) { slot = i; break; }
+
+		if (!slot)
+		{
+			if (num_bodies >= MAX_BODIES)
+			{
+				console->add_entry("Physics body slots full (heightfield)", FIXME, PHYS);
+				free(heights);
+				return 0;
+			}
+			slot = num_bodies++;
+		}
+
+		btHeightfieldTerrainShape* shape = new btHeightfieldTerrainShape(
+			n, n, heights, 1.f, min_h, max_h, 1, PHY_FLOAT, false);
+		shape->setLocalScaling(btVector3(spacing, 1.f, spacing));
+
+		btTransform start;
+		start.setIdentity();
+		start.setOrigin(btVector3(origin.x, (min_h + max_h) * .5f, origin.z));
+
+		btDefaultMotionState* motion = new btDefaultMotionState(start);
+		btRigidBody::btRigidBodyConstructionInfo info(0.f, motion, shape, btVector3(0, 0, 0));
+		btRigidBody* body = new btRigidBody(info);
+		body->setFriction(GROUND_FRICTION);
+		body->setUserIndex(slot);
+		world->addRigidBody(body);
+
+		bodies[slot] = { body, 0, vec3(0), 0.f };
+		bodies[slot].spawn_pos = origin;
+		bodies[slot].owned_data = heights;
+		return slot;
+	}
+
+	// drop a body and free its slot : streaming chunks reuse the slot
+	void remove_body(uint phys_id)
+	{
+		if (phys_id == 0 || phys_id >= num_bodies) return;
+
+		Phys_Body& b = bodies[phys_id];
+		if (!b.body) return;
+
+		world->removeRigidBody(b.body);
+		if (b.body->getMotionState()) delete b.body->getMotionState();
+		if (b.body->getCollisionShape()) delete b.body->getCollisionShape();
+		delete b.body;
+		free(b.owned_data);
+
+		b = {};
+	}
+
 	uint add_box(vec3 pos, vec3 half_extents, float mass, vec3 tilt = vec3(0))
 	{
 		return add_body(PHYS_BOX, pos, half_extents, mass, tilt);
@@ -322,6 +392,46 @@ struct Physics
 	uint add_ground(float half_size, float top = 0.f)
 	{
 		return add_body(PHYS_BOX, vec3(0, top - 1.f, 0), vec3(half_size, 1, half_size), 0);
+	}
+
+	// static triangle soup : voxel terrain, built once per scene. the caller owns
+	// the btTriangleMesh and must keep it alive until the shape is destroyed
+	uint add_static_mesh(btTriangleMesh* triangles)
+	{
+		if (!triangles)
+		{
+			console->add_entry("Physics static mesh : no triangles", FIXME, PHYS);
+			return 0;
+		}
+
+		uint slot = 0;
+		for (uint i = 1; i < num_bodies; i++)
+			if (!bodies[i].body) { slot = i; break; }
+
+		if (!slot)
+		{
+			if (num_bodies >= MAX_BODIES)
+			{
+				console->add_entry("Physics body slots full (static mesh)", FIXME, PHYS);
+				return 0;
+			}
+			slot = num_bodies++;
+		}
+
+		btBvhTriangleMeshShape* shape = new btBvhTriangleMeshShape(triangles, true, true);
+		btTransform start;
+		start.setIdentity();
+
+		btDefaultMotionState* motion = new btDefaultMotionState(start);
+		btRigidBody::btRigidBodyConstructionInfo info(0.f, motion, shape, btVector3(0, 0, 0));
+		btRigidBody* body = new btRigidBody(info);
+		body->setFriction(GROUND_FRICTION);
+		body->setUserIndex(slot);
+		world->addRigidBody(body);
+
+		bodies[slot] = { body, 0, vec3(0), 0.f };
+		bodies[slot].spawn_pos = vec3(0);
+		return slot;
 	}
 
 	// ragdoll : an 11-capsule figure with 10 joints. every part is a regular
@@ -524,6 +634,23 @@ struct Physics
 			vec3(m[4], m[5], m[6]),
 			vec3(m[8], m[9], m[10]));
 		return true;
+	}
+
+	// move a body outright : zeroed and awake, so the next step starts from the
+	// new pose instead of carrying old momentum
+	void set_body_pose(uint phys_id, vec3 pos)
+	{
+		if (phys_id == 0 || phys_id >= num_bodies || !bodies[phys_id].body) return;
+
+		btRigidBody* b = bodies[phys_id].body;
+		btTransform t = b->getWorldTransform();
+		t.setOrigin(btVector3(pos.x, pos.y, pos.z));
+
+		if (b->getMotionState()) b->getMotionState()->setWorldTransform(t);
+		b->setWorldTransform(t);
+		b->setLinearVelocity(btVector3(0, 0, 0));
+		b->setAngularVelocity(btVector3(0, 0, 0));
+		b->activate();
 	}
 
 	// raw readouts for the ux body table (statics included)

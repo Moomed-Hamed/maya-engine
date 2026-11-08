@@ -1,5 +1,10 @@
 #include "audio.h"
 
+#ifdef _WIN32
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
+
 /* ------------------------- *
 	-   Window & Input      -
  * ------------------------- */
@@ -33,6 +38,7 @@ struct Lighting
 	float contrast;
 	float saturation;
 	float fog_density;
+	float cloud_weather; // 0 = clear, 1 = storm deck
 	float multiscatter;
 	float ao_strength;
 
@@ -302,8 +308,8 @@ Lighting lighting_trade_winds()
 	l.saturation    = 1.08f;
 	l.fog_density   = 0.0024f;
 
-	l.zenith = vec3(0.055f, 0.220f, 0.500f);
-	l.haze   = vec3(0.300f, 0.480f, 0.620f);
+	l.zenith = vec3(0.030f, 0.180f, 0.520f);
+	l.haze   = vec3(0.200f, 0.380f, 0.620f);
 	l.glow   = vec3(0.980f, 0.680f, 0.380f);
 	l.ground = vec3(0.045f, 0.065f, 0.055f);
 
@@ -476,7 +482,7 @@ void update_mouse(Mouse* mouse, GLFWwindow* instance, uint screen_x, uint screen
 	mouse->left_button.is_pressed  = glfwGetMouseButton(instance, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 }
 
-#define NUM_KEYBOARD_BUTTONS 35 // update when adding keyboard buttons
+#define NUM_KEYBOARD_BUTTONS 45 // update when adding keyboard buttons
 struct Keyboard
 {
 	union
@@ -495,6 +501,8 @@ struct Keyboard
 			Button UP, DOWN, LEFT, RIGHT;
 
 			Button F1;
+			Button ONE, TWO, THREE, FOUR, FIVE, SIX, SEVEN, EIGHT, NINE;
+			Button F5;
 		};
 	};
 };
@@ -516,6 +524,16 @@ void init_keyboard(Keyboard* keyboard)
 	keyboard->RIGHT = { false, false, GLFW_KEY_RIGHT };
 
 	keyboard->F1    = { false, false, GLFW_KEY_F1    };
+	keyboard->ONE   = { false, false, GLFW_KEY_1     };
+	keyboard->TWO   = { false, false, GLFW_KEY_2     };
+	keyboard->THREE = { false, false, GLFW_KEY_3     };
+	keyboard->FOUR  = { false, false, GLFW_KEY_4     };
+	keyboard->FIVE  = { false, false, GLFW_KEY_5     };
+	keyboard->SIX   = { false, false, GLFW_KEY_6     };
+	keyboard->SEVEN = { false, false, GLFW_KEY_7     };
+	keyboard->EIGHT = { false, false, GLFW_KEY_8     };
+	keyboard->NINE  = { false, false, GLFW_KEY_9     };
+	keyboard->F5    = { false, false, GLFW_KEY_F5    };
 }
 void update_keyboard(Keyboard* keyboard, GLFWwindow* instance)
 {
@@ -539,7 +557,7 @@ struct RenderTarget
 	GLuint albedo_tx;
 	GLuint depth_tx; // could also use a render buffer (write only)
 
-	void init(uint height, uint width)
+	void init(uint height, uint width, GLint internal_format = GL_RGBA16F)
 	{
 		glGenFramebuffers(1, &fbo);
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -554,7 +572,7 @@ struct RenderTarget
 		// normal color buffer
 		glGenTextures(1, &normal_tx);
 		glBindTexture(GL_TEXTURE_2D, normal_tx);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+		glTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
@@ -609,7 +627,7 @@ struct HdrTarget
 	GLuint depth_tx; // optional : lit depth, sampled by the sky-disk post pass
 	bool complete;
 
-	void init(uint height, uint width)
+	void init(uint height, uint width, GLint internal_format = GL_RGBA16F)
 	{
 		depth_tx = 0;
 		glGenFramebuffers(1, &fbo);
@@ -710,10 +728,45 @@ struct GameWindow
 	// foam shading + short-chop normal map : filled by whichever scene owns the sea
 	vec3  water_foam_color;
 	float water_foam_roughness;
+	float water_shore_foam;
+	float water_sun;
 	uint  water_normal_tx;
 	float water_detail;
+	float water_chop;
 	float water_sss;
 	float water_time;
+	vec3  water_absorb;
+	bool  water_underwater; // a water plane exists this frame
+	float water_level;      // world y of the water surface
+
+	// live render controls (Render tab + performance overlay)
+	bool  render_shadows;
+	bool  render_clouds;
+	bool  render_godrays;
+	bool  render_ssr;
+	bool  render_ssao;
+	bool  perf_overlay;
+	float bloom_strength;
+	int   cloud_steps;
+	int   ssr_steps;
+	int   godray_steps;
+	int   quality_preset;
+
+	// per-phase CPU timing, milliseconds
+	float phase_update_ms, phase_shadow_ms, phase_gbuf_ms, phase_light_ms;
+	float phase_cloud_ms, phase_water_ms, phase_post_ms, phase_ui_ms;
+
+	// compute-baked cloud noise (3D texture)
+	GLuint cloud_noise_tx;
+	ShaderProgram cloud_noise_shader;
+	int   cloud_noise_size;
+	float cloud_noise_ms;
+	vec3  underwater_color;
+	float underwater_density;
+	vec2  sun_screen_uv;   // sun position in screen uv, for god rays
+	bool  sun_screen_on;
+	mat4  water_proj_view;
+	vec3  water_view_pos;
 
 	// deferred rendering
 	struct {
@@ -728,8 +781,16 @@ struct GameWindow
 	struct {
 		HdrTarget lit;
 		HdrTarget scene_copy;
+		HdrTarget bloom_a;
+		HdrTarget bloom_b;
+		HdrTarget cloud_a;
 		ShaderProgram tonemap;
 		ShaderProgram sky;
+		ShaderProgram bright;
+		ShaderProgram blur;
+		ShaderProgram underwater;
+		ShaderProgram cloud;
+		ShaderProgram cloud_comp;
 	} hdr;
 
 	// filled by the renderer's shadow pass, read by the lighting shader
@@ -752,6 +813,7 @@ struct GameWindow
 
 	void draw_lighting(vec3 view_position, mat4 proj_view, const Lighting* lighting);
 	void draw_sky_disks(const Lighting* lighting, mat4 proj_view, vec3 camera_pos);
+	void draw_clouds(mat4 proj_view, vec3 camera_pos, const Lighting* lighting);
 	void post_process(const Lighting* lighting);
 
 	void shutdown();
@@ -808,17 +870,99 @@ const char* gl_error_name(uint code)
 	}
 }
 
+const char* RENDER_QUALITY_NAMES[4] = { "performance", "balanced", "quality", "ultra" };
+
+inline void render_quality_apply(GameWindow* w, int q)
+{
+	if (q < 0) q = 0;
+	if (q > 3) q = 3;
+	w->quality_preset = q;
+	w->render_shadows  = true;
+	w->render_clouds   = true;
+	w->render_ssao     = q >= 1;
+	w->render_ssr      = q >= 1;
+	w->render_godrays  = q >= 1;
+	w->cloud_steps     = q == 0 ? 32 : q == 1 ? 64 : q == 2 ? 96 : 128;
+	w->ssr_steps       = q == 0 ? 0  : q == 1 ? 12 : q == 2 ? 16 : 20;
+	w->godray_steps    = q == 0 ? 0  : q == 1 ? 12 : q == 2 ? 16 : 20;
+	w->bloom_strength  = q == 0 ? .02f : q == 1 ? .04f : q == 2 ? .06f : .08f;
+}
+
+inline size_t process_memory_bytes()
+{
+	PROCESS_MEMORY_COUNTERS pmc = {};
+	if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+		return (size_t)pmc.WorkingSetSize;
+	return 0;
+}
+
+// every render target, itemised : the Memory tab prints these rows directly
+struct Gpu_Memory
+{
+	size_t gbuffer;    // position 32f, normal 16f, albedo 8, depth 24
+	size_t lit;        // colour 32f + depth
+	size_t scene_copy; // colour 32f, read by the water pass
+	size_t sky_depth;  // depth copy used by the sky disks
+	size_t bloom;      // two half-res 16f targets
+	size_t cloud;      // full-res 16f cloud slab
+	size_t noise;      // baked 128^3 cloud-noise volume
+
+	size_t targets() const
+	{
+		return gbuffer + lit + scene_copy + sky_depth + bloom + cloud + noise;
+	}
+};
+
+inline Gpu_Memory gpu_memory(const GameWindow* w)
+{
+	size_t px = (size_t)w->screen_width * (size_t)w->screen_height;
+
+	Gpu_Memory m = {};
+	m.gbuffer    = px * 32;      // 16 + 8 + 4 + 4 bytes
+	m.lit        = px * 20;      // colour 16 + depth 4 (colour is RGBA32F : 16)
+	m.scene_copy = px * 16;
+	m.sky_depth  = px * 4;
+	m.bloom      = (px / 4) * 16;
+	m.cloud      = px * 8;
+	m.noise      = (size_t)w->cloud_noise_size * w->cloud_noise_size
+	             * w->cloud_noise_size * 8u;
+	return m;
+}
+
 void GameWindow::init(uint screen_width, uint screen_height)
 {
 	timer.init();
 	frame_milliseconds_target = 1000.f / 120.f; // frame cap : 120 fps
+	render_shadows = true;
+	render_clouds = true;
+	render_godrays = true;
+	render_ssr = true;
+	render_ssao = true;
+	perf_overlay = true;
+	bloom_strength = .06f;
+	cloud_steps = 96;
+	ssr_steps = 16;
+	godray_steps = 16;
+	quality_preset = 2;
+	phase_update_ms = phase_shadow_ms = phase_gbuf_ms = phase_light_ms = 0.f;
+	phase_cloud_ms = phase_water_ms = phase_post_ms = phase_ui_ms = 0.f;
 	far_plane = 256.f;
 
 	water_foam_color = vec3(.82f, .88f, .90f);
 	water_foam_roughness = .55f;
+	water_shore_foam = 1.f;
+	water_sun = 1.f;
 	water_detail = .70f;
+	water_chop = .15f;
 	water_sss = .60f;
 	water_time = 0.f;
+	water_absorb = vec3(.34f, .10f, .065f);
+	water_underwater = false;
+	water_level = 0.f;
+	underwater_color = vec3(.02f, .12f, .18f);
+	underwater_density = .06f;
+	sun_screen_uv = vec2(-1.f);
+	sun_screen_on = false;
 	shadow_tx = 0;
 	shadow_on = false;
 	shadow_is_moon = false;
@@ -839,8 +983,8 @@ void GameWindow::init(uint screen_width, uint screen_height)
 	} console->add_entry((char*)"Init GLFW", SEVERITY::SUCCESS, LOGSOURCE::WNDW);
 
 	// OpenGL window hints
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 	glfwWindowHint(GLFW_RESIZABLE, GL_FALSE);
@@ -954,11 +1098,55 @@ void GameWindow::init(uint screen_width, uint screen_height)
 	gbuf.rendertarget.init(screen_height, screen_width);
 
 	// linear HDR targets : the lit one shares the g-buffer depth for forward water
-	hdr.lit.init(screen_height, screen_width);
+	// 32-bit lit targets : the fog and shadow gradients are the first thing to
+	// band in half floats once exposure and ACES stretch the darks
+	hdr.lit.init(screen_height, screen_width, GL_RGBA32F);
 	hdr.lit.add_depth_buffer(screen_height, screen_width);
-	hdr.scene_copy.init(screen_height, screen_width);
+	hdr.scene_copy.init(screen_height, screen_width, GL_RGBA32F);
+	hdr.bloom_a.init(screen_height / 2, screen_width / 2);
+	hdr.bloom_b.init(screen_height / 2, screen_width / 2);
+	hdr.cloud_a.init(screen_height, screen_width);
 	hdr.tonemap.create("assets/shaders/gbuf.vert", "assets/shaders/post.frag");
 	hdr.sky.create("assets/shaders/gbuf.vert", "assets/shaders/sky.frag");
+	hdr.bright.create("assets/shaders/gbuf.vert", "assets/shaders/bright.frag");
+	hdr.blur.create("assets/shaders/gbuf.vert", "assets/shaders/blur.frag");
+	hdr.underwater.create("assets/shaders/gbuf.vert", "assets/shaders/underwater.frag");
+	hdr.cloud.create("assets/shaders/gbuf.vert", "assets/shaders/clouds.frag");
+	hdr.cloud_comp.create("assets/shaders/gbuf.vert", "assets/shaders/cloud_composite.frag");
+
+	// one-time GPU bake of the cloud noise volume
+	cloud_noise_size = 128;
+	glGenTextures(1, &cloud_noise_tx);
+	glBindTexture(GL_TEXTURE_3D, cloud_noise_tx);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA16F, cloud_noise_size, cloud_noise_size,
+	             cloud_noise_size, 0, GL_RGBA, GL_FLOAT, NULL);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_REPEAT);
+
+	cloud_noise_shader.create_compute("assets/shaders/cloud_noise.comp");
+	cloud_noise_shader.bind();
+	glBindImageTexture(0, cloud_noise_tx, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+	glUniform1i(glGetUniformLocation(cloud_noise_shader.id, "noise_size"), cloud_noise_size);
+	double noise_start = glfwGetTime();
+	glDispatchCompute(cloud_noise_size / 8, cloud_noise_size / 8, cloud_noise_size / 8);
+	glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+	glFinish();
+	cloud_noise_ms = (float)((glfwGetTime() - noise_start) * 1000.0);
+
+	// bloom and tonemap read these at half / full res : linear filtering keeps
+	// the upsample and downsample soft instead of blocky
+	GLuint soft_targets[3] = { hdr.lit.color_tx, hdr.bloom_a.color_tx, hdr.bloom_b.color_tx };
+	for (uint i = 0; i < 3; i++)
+	{
+		glBindTexture(GL_TEXTURE_2D, soft_targets[i]);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
 
 	glGenTextures(1, &sky_depth_tx);
 	glBindTexture(GL_TEXTURE_2D, sky_depth_tx);
@@ -1115,6 +1303,9 @@ void GameWindow::draw_lighting(vec3 view_position, mat4 proj_view, const Lightin
 
 	// the occlusion taps project world points back onto this screen
 	glUniformMatrix4fv(glGetUniformLocation(gbuf.shader.id, "proj_view"), 1, GL_FALSE, (float*)&proj_view);
+	mat4 inv_pv = glm::inverse(proj_view);
+	glUniformMatrix4fv(glGetUniformLocation(gbuf.shader.id, "inv_proj_view"), 1, GL_FALSE,
+	                   (float*)&inv_pv);
 
 	// per-scene lighting
 	static Lighting fallback = lighting_day();
@@ -1144,7 +1335,9 @@ void GameWindow::draw_lighting(vec3 view_position, mat4 proj_view, const Lightin
 	gbuf.shader.set_float("fog_density",   l.fog_density);
 	gbuf.shader.set_float("multiscatter",  l.multiscatter);
 	gbuf.shader.set_float("ao_strength",   l.ao_strength);
+	gbuf.shader.set_float("ssao_on",       render_ssao ? 1.f : 0.f);
 	gbuf.shader.set_float("night",         l.night);
+	gbuf.shader.set_float("sky_time",      timer.microseconds_elapsed() * 1e-6f);
 
 	gbuf.shader.set_vec3("zenith", l.zenith);
 	gbuf.shader.set_vec3("haze",   l.haze);
@@ -1165,7 +1358,7 @@ void GameWindow::draw_lighting(vec3 view_position, mat4 proj_view, const Lightin
 	gbuf.shader.set_float("shadow_world_texel", shadow_world_texel);
 	gbuf.shader.set_float("shadow_on", shadow_on ? 1.f : 0.f);
 	gbuf.shader.set_float("shadow_moon", shadow_is_moon ? 1.f : 0.f);
-	gbuf.shader.set_float("shadow_bias", .0009f);
+	gbuf.shader.set_float("shadow_bias", .0003f);
 	if (shadow_on && shadow_tx)
 	{
 		glActiveTexture(GL_TEXTURE3);
@@ -1193,6 +1386,11 @@ void GameWindow::draw_sky_disks(const Lighting* lighting, mat4 proj_view, vec3 c
 	vec2 moon_uv = (moon_clip.w > 0.f)
 	             ? vec2(moon_clip.x / moon_clip.w * .5f + .5f, moon_clip.y / moon_clip.w * .5f + .5f)
 	             : vec2(-1.f);
+
+	sun_screen_uv = sun_uv;
+	sun_screen_on = l.sun_disk > .01f && l.sun_direction.y < .02f
+	             && sun_uv.x > -.6f && sun_uv.x < 1.6f
+	             && sun_uv.y > -.6f && sun_uv.y < 1.6f;
 
 	// copy the opaque g-buffer depth so the disk shader can sample the mask
 	// without reading the depth texture attached to the target it draws into
@@ -1232,28 +1430,147 @@ void GameWindow::draw_sky_disks(const Lighting* lighting, mat4 proj_view, vec3 c
 }
 
 // exposure -> ACES -> display encode, from the linear lit target to the screen
+// half-resolution volumetric clouds. rendering and blurring at half resolution
+// is what lets the raymarch use an ordered dither without the result reading as
+// noisy; the composite only covers sky pixels because the cloud shader discards
+// anything the g-buffer depth marks as terrain
+void GameWindow::draw_clouds(mat4 proj_view, vec3 camera_pos, const Lighting* lighting)
+{
+	static Lighting fallback = lighting_day();
+	const Lighting& l = lighting ? *lighting : fallback;
+	// --- raymarch into the full-res cloud target -----------------------------
+	hdr.cloud_a.bind();
+	glViewport(0, 0, screen_width, screen_height);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_BLEND);
+	glDepthMask(GL_FALSE);
+	glDisable(GL_CULL_FACE);
+	glClearColor(0.f, 0.f, 0.f, 0.f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	hdr.cloud.bind();
+	hdr.cloud.set_mat4("inv_proj_view", glm::inverse(proj_view));
+	hdr.cloud.set_vec3 ("view_pos", camera_pos);
+	hdr.cloud.set_vec3 ("sun_direction", l.sun_direction);
+	hdr.cloud.set_vec3 ("sun_color", l.sun_color);
+	hdr.cloud.set_vec3 ("ambient_up", l.ambient_up);
+	hdr.cloud.set_float("sun_power", l.sun_power);
+	hdr.cloud.set_float("cloud_time", timer.microseconds_elapsed() * 1e-6f);
+	hdr.cloud.set_float("cloud_weather", glm::clamp(l.cloud_weather, 0.f, 1.f));
+	hdr.cloud.set_int("cloud_steps", cloud_steps);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, gbuf.rendertarget.depth_tx);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_3D, cloud_noise_tx);
+	glActiveTexture(GL_TEXTURE0);
+	glBindVertexArray(gbuf.VAO);
+	glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, 1);
+
+	// --- premultiplied composite over the lit frame --------------------------
+	hdr.lit.bind();
+	glViewport(0, 0, screen_width, screen_height);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	hdr.cloud_comp.bind();
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, hdr.cloud_a.color_tx);
+	glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, 1);
+
+	glDisable(GL_BLEND);
+	glEnable(GL_CULL_FACE);
+	glEnable(GL_DEPTH_TEST);
+	glDepthMask(GL_TRUE);
+}
+
 void GameWindow::post_process(const Lighting* lighting)
 {
 	Lighting fallback = lighting_day();
 	const Lighting& l = lighting ? *lighting : fallback;
 
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, screen_width, screen_height);
+	uint bw = screen_width / 2;
+	uint bh = screen_height / 2;
+
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_BLEND);
-	glDepthMask(GL_TRUE);
+	glDepthMask(GL_FALSE);
+
+	// --- waterline / underwater composite : lit frame -> scene_copy ---------
+	hdr.scene_copy.bind();
+	glViewport(0, 0, screen_width, screen_height);
+	hdr.underwater.bind();
+	hdr.underwater.set_vec3("view_pos", water_view_pos);
+	mat4 inv_water = glm::inverse(water_proj_view);
+	hdr.underwater.set_mat4("inv_proj_view", inv_water);
+	hdr.underwater.set_float("water_on", water_underwater ? 1.f : 0.f);
+	hdr.underwater.set_float("water_level", water_level);
+	hdr.underwater.set_vec3("underwater_color", underwater_color);
+	hdr.underwater.set_float("underwater_density", underwater_density);
+	hdr.underwater.set_float("near_plane", .1f);
+	hdr.underwater.set_float("far_plane", far_plane);
+	hdr.underwater.set_float("water_time", water_time);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, hdr.lit.color_tx);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, gbuf.rendertarget.depth_tx);
+	glBindVertexArray(gbuf.VAO);
+	glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, 1);
+
+	// --- bloom : bright pass at half res, then a separable blur ---------------
+	hdr.bloom_a.bind();
+	glViewport(0, 0, bw, bh);
+	hdr.bright.bind();
+	hdr.bright.set_vec3("view_pos", vec3(0.f));
+	hdr.bright.set_float("threshold", 1.60f);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, hdr.scene_copy.color_tx);
+	glBindVertexArray(gbuf.VAO);
+	glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, 1);
+
+	hdr.bloom_b.bind();
+	hdr.blur.bind();
+	hdr.blur.set_vec3("view_pos", vec3(0.f));
+	hdr.blur.set_vec2("texel", vec2(1.f / (float)bw, 1.f / (float)bh));
+	hdr.blur.set_vec2("dir", vec2(1.f, 0.f));
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, hdr.bloom_a.color_tx);
+	glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, 1);
+
+	hdr.bloom_a.bind();
+	hdr.blur.set_vec2("dir", vec2(0.f, 1.f));
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, hdr.bloom_b.color_tx);
+	glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, 1);
+
+	// --- exposure -> ACES -> display encode, with the bloom add ---------------
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, screen_width, screen_height);
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-	glDepthMask(GL_FALSE);
 
 	hdr.tonemap.bind();
 	hdr.tonemap.set_float("exposure", l.exposure);
 	hdr.tonemap.set_float("contrast", l.contrast);
 	hdr.tonemap.set_float("saturation", l.saturation);
+	hdr.tonemap.set_float("bloom_strength", bloom_strength);
 	hdr.tonemap.set_vec3("view_pos", vec3(0.f));
+	hdr.tonemap.set_vec2("sun_screen", sun_screen_uv);
+	hdr.tonemap.set_float("sun_on", sun_screen_on ? 1.f : 0.f);
+	hdr.tonemap.set_vec3("sun_color", l.sun_color);
+	hdr.tonemap.set_float("godray_strength", 0.09f);
+	hdr.tonemap.set_float("godray_on", render_godrays ? 1.f : 0.f);
+	hdr.tonemap.set_int("godray_steps", godray_steps);
+	hdr.tonemap.set_float("weather", glm::clamp(l.cloud_weather, 0.f, 1.f));
+	hdr.tonemap.set_float("rain_time", timer.microseconds_elapsed() * 1e-6f);
 
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, hdr.lit.color_tx);
+	glBindTexture(GL_TEXTURE_2D, hdr.scene_copy.color_tx);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, hdr.bloom_a.color_tx);
+	glActiveTexture(GL_TEXTURE2);
+	glBindTexture(GL_TEXTURE_2D, hdr.lit.depth_tx);
+	glActiveTexture(GL_TEXTURE3);
+	glBindTexture(GL_TEXTURE_2D, hdr.cloud_a.color_tx);
 
 	glBindVertexArray(gbuf.VAO);
 	glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, 1);

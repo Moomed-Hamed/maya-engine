@@ -1,0 +1,69 @@
+#version 430 core
+
+// one-time cloud noise bake : four tileable fbm fields packed into a 3D texture
+// (shape, detail, coverage mask, warp). the cloud raymarch then samples this
+// instead of evaluating procedural fbm at every step
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout (rgba16f, binding = 0) uniform image3D noise_img;
+uniform int noise_size;
+
+uint hash_u(uint x)
+{
+	x = (x << 13u) ^ x;
+	return x * (x * x * 15731u + 789221u) + 1376312589u;
+}
+
+float cell_hash(ivec3 p, int period)
+{
+	p = ivec3(mod(vec3(p), vec3(period)));
+	uint n = uint(p.x) * 73856093u ^ uint(p.y) * 19349663u ^ uint(p.z) * 83492791u;
+	return float(hash_u(n) & 0x7fffffffu) / 2147483647.0;
+}
+
+float value_noise(vec3 p, int period)
+{
+	vec3 i = floor(p);
+	vec3 f = fract(p);
+	f = f * f * (3.0 - 2.0 * f);
+	ivec3 c = ivec3(i);
+	float n000 = cell_hash(c + ivec3(0, 0, 0), period);
+	float n100 = cell_hash(c + ivec3(1, 0, 0), period);
+	float n010 = cell_hash(c + ivec3(0, 1, 0), period);
+	float n110 = cell_hash(c + ivec3(1, 1, 0), period);
+	float n001 = cell_hash(c + ivec3(0, 0, 1), period);
+	float n101 = cell_hash(c + ivec3(1, 0, 1), period);
+	float n011 = cell_hash(c + ivec3(0, 1, 1), period);
+	float n111 = cell_hash(c + ivec3(1, 1, 1), period);
+	return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+	           mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+
+// input p is 0..1, the base frequency is an integer so the result tiles at p=1
+float tile_fbm(vec3 p, int base_freq)
+{
+	float v = 0.0;
+	float a = 0.5;
+	int freq = base_freq;
+	for (int i = 0; i < 3; i++)
+	{
+		v += a * value_noise(p * float(freq), freq);
+		freq *= 2;
+		a *= 0.5;
+	}
+	return v;
+}
+
+void main()
+{
+	ivec3 gid = ivec3(gl_GlobalInvocationID);
+	if (any(greaterThanEqual(gid, ivec3(noise_size)))) return;
+
+	vec3 p = vec3(gid) / float(noise_size);
+	float shape  = tile_fbm(p + vec3(0.11, 0.23, 0.37), 4);
+	float detail = tile_fbm(p + vec3(0.51, 0.17, 0.73), 8);
+	float mask   = tile_fbm(p + vec3(0.07, 0.61, 0.29), 2);
+	float warp   = tile_fbm(p + vec3(0.43, 0.31, 0.19), 3);
+
+	imageStore(noise_img, gid, vec4(shape, detail, mask, warp));
+}

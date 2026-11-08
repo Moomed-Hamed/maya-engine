@@ -1,4 +1,7 @@
 #include "fluids.h"
+#include "world.h"
+
+void player_update_voxel(Player* p, GameWindow* window, World* w);
 
 /* ------------------------- *
 	-        Scenes         -
@@ -10,7 +13,7 @@ static bool ux_panel_visible = true;
 
 static float ux_panel_width(GameWindow* window)
 {
-	float width = window->screen_height * (620.f / 1080.f);
+	float width = window->screen_height * (660.f / 1080.f);
 	float max_width = window->screen_width * .45f;
 	return width > max_width ? max_width : width;
 }
@@ -25,8 +28,7 @@ struct Scene
 	Camera camera;    // the view the world is rendered from
 	mat4   proj_view; // built from the camera every frame in update()
 
-	// studio / preview orbit : independent of the player and preserved across
-	// scene reloads by the preview scene
+	// studio / preview orbit : independent of the player
 	bool   orbit_cam;
 	vec3   orbit_target;
 	float  orbit_yaw, orbit_pitch, orbit_distance;
@@ -34,6 +36,7 @@ struct Scene
 	Physics phys; // owns motion, the props read their pose from it
 	Water   water;   // fft ocean grid for the ocean scene
 	Shallow_Water shallow; // small fd patch for the shallow scene
+	World   world;   // infinite streaming voxel volume for the world + terrain scenes
 
 	Player player; // the capsule and its camera
 
@@ -52,11 +55,27 @@ struct Scene
 		char label[24]; // drawn over it in the world (empty = none)
 	} props[MAX_PROPS];
 	uint num_props;
+	int  world_water_prop; // index of the world water plane, -1 when absent
+	uint light_mesh;       // emissive cube used by torches and light blocks
+
+	// block drops : a tiny cube that falls, rests on the ground and is picked
+	// up when the player walks over it
+	struct Drop {
+		vec3  pos;
+		vec3  vel;
+		uint8 block;
+		float age;
+		bool  active;
+	} drops[256];
+	uint drop_mesh;
+	uint drop_prop_start;
 
 	bool show_labels; // debug toggle : world labels on/off
+	bool shadows;     // sun shadow pass for this scene
 	bool reload_requested; // scene asks the manager to rebuild it next frame
 	bool water_dirty;     // water settings changed : refresh the spectrum or the mesh
 	bool water_spectrum;  // wind, seed or size changed : rebuild h0 as well
+	bool world_dirty;     // terrain settings changed : regenerate the chunk volume
 
 	Lighting lighting;      // the deferred pass's per-scene rig
 	uint     lighting_kind; // LightingPreset this scene started from
@@ -143,12 +162,13 @@ struct Scene
 	// floor_resolution 0 = one quad per metre
 	void begin(GameRenderer* renderer, vec3 cam_pos, float yaw, float pitch,
 	           float ground_size, float ground_half, uint floor_resolution = 0,
-	           float floor_y = 0.f)
+	           float floor_y = 0.f, bool add_ground = true)
 	{
 		// zero in place : the scene owns multi-megabyte grids, and `= {}` would
 		// build a temporary of the whole struct on the stack
 		memset(this, 0, sizeof(*this));
 		show_labels = true;
+		shadows = true;
 		local_lights = true;
 		shadow_extent = 40.f;
 		far_plane = fmaxf(256.f, ground_size * 2.5f);
@@ -165,6 +185,10 @@ struct Scene
 
 		phys.init();
 
+		light_mesh = renderer->add_mesh(MeshFactory::generate_cube(1.f));
+
+		if (!add_ground) return;
+
 		// floor : one generated plane with material-only shading
 		uint resolution = floor_resolution ? floor_resolution
 		                                    : (uint)(ground_size > 1.f ? ground_size : 1.f);
@@ -177,7 +201,7 @@ struct Scene
 	void finish(const char* name)
 	{
 		// a scene without a player still gets eyes to look through
-		if (!player.body) player.init(&phys, vec3(0, 5, 8));
+		if (!player.body && !player.voxel_mode) player.init(&phys, vec3(0, 5, 8));
 
 		group_props();
 
@@ -207,8 +231,10 @@ struct Scene
 	// buffers and caches from SceneManager
 	void shutdown(GameRenderer*)
 	{
+		world_shutdown(&world, &phys);
 		phys.shutdown();
 		num_props = 0;
+		world_water_prop = -1;
 	}
 
 	// called once per frame : input -> camera -> matrices, then submit this frame's instances
@@ -238,7 +264,10 @@ struct Scene
 			update_fly_camera(&camera, window, window->dtime, fly_speed_scale);
 		}
 
-		player.update(window, &phys);
+		if (player.voxel_mode)
+			player_update_voxel(&player, window, &world);
+		else
+			player.update(window, &phys);
 
 		phys.step(window->dtime);
 
@@ -304,8 +333,818 @@ struct Scene
 
 		if (batch_count)
 			renderer->buffer(batch_mode).append_instances(batch_mesh, batch_count, prop_batch);
+
+		player.draw_arms(renderer);
+		player.draw_steve(renderer);
 	}
 };
+
+// ---- voxel world : scene plumbing ------------------------------------------
+
+void world_add_props(Scene* s, World* w)
+{
+	for (uint i = 0; i < WORLD_MAX_CHUNKS; i++)
+	{
+		World_Chunk& ch = w->chunks[i];
+		if (!ch.used) continue;
+
+		vec3 origin((float)(ch.cx * WORLD_CHUNK), w->render_offset_y,
+		            (float)(ch.cz * WORLD_CHUNK));
+		for (uint b = 1; b < WORLD_BLOCK_COUNT; b++)
+		{
+			if (!ch.mesh[b]) continue;
+
+			Scene::Prop& p = s->add_prop(ch.mesh[b], origin, 0, 1.f);
+			p.mat_a = vec4(WORLD_BLOCKS[b].albedo, 0.f);
+			// ao = 1; the texture-albedo flag is the third component and stays 0,
+			// so blocks render as flat colours
+			p.mat_b = vec4(WORLD_BLOCKS[b].roughness, 1.f, 0.f,
+			               world_block_emissive(b) ? 1.f : 0.f);
+		}
+	}
+
+	if (w->water_mesh)
+	{
+		s->world_water_prop = (int)s->num_props;
+		Scene::Prop& p = s->add_prop(w->water_mesh, vec3(0), 0, 1.f);
+		p.water  = true;
+		p.mat_a = vec4(WORLD_WATER_ALBEDO, world_config.sea_level + w->render_offset_y);
+		p.mat_b = vec4(.14f, 1.f, 0.f, 0.f);
+	}
+
+	s->drop_prop_start = s->num_props;
+}
+
+// gather nearby emissive blocks into the local light list. the radius is small
+// on purpose : a torch should light its room, not the whole render distance
+void world_collect_lights(Scene* s)
+{
+	s->num_lights = 0;
+	vec3 c = s->camera.position;
+	int cx = world_floor(c.x);
+	int cy = world_floor(c.y - s->world.render_offset_y);
+	int cz = world_floor(c.z);
+	const int R = 12;
+
+	for (int y = cy - 8; y <= cy + 8 && s->num_lights < MAX_LIGHTS; y++)
+		for (int z = cz - R; z <= cz + R && s->num_lights < MAX_LIGHTS; z++)
+			for (int x = cx - R; x <= cx + R && s->num_lights < MAX_LIGHTS; x++)
+			{
+				uint8 b = world_get_block(&s->world, x, y, z);
+				if (!world_block_emissive(b)) continue;
+				s->add_light(vec3((float)x + .5f,
+				                  (float)y + .5f + s->world.render_offset_y,
+				                  (float)z + .5f),
+				             world_block_light_color(b),
+				             world_block_light_radius(b),
+				             world_block_light_power(b));
+
+				// a glowing cube for the block itself, independent of the chunk mesh
+				Scene::Prop& lamp = s->add_prop(s->light_mesh,
+				                                vec3((float)x + .5f,
+				                                     (float)y + .5f + s->world.render_offset_y,
+				                                     (float)z + .5f), 0, 1.f);
+				lamp.mat_a = vec4(world_block_light_color(b), 0.f);
+				lamp.mat_b = vec4(.96f, 1.f, 0.f, 1.f);
+			}
+
+	s->local_lights = s->num_lights > 0;
+}
+
+void world_stream_rebuild(Scene* s, GameRenderer* renderer, int cx, int cz, bool collision)
+{
+	DrawBuffer& db  = renderer->buffer(MODE_STATIC_UV);
+	DrawBuffer& wdb = renderer->buffer(MODE_WATER);
+
+	if (s->world.built)
+	{
+		db.rewind(s->world.mesh_mark, s->world.geom_mark, s->world.indx_mark);
+		wdb.rewind(s->world.water_mesh_mark, s->world.water_geom_mark, s->world.water_indx_mark);
+		s->num_props = s->world.first_prop;
+	}
+
+	s->world.mesh_mark       = db.num_meshes;
+	s->world.geom_mark       = db.geom_size;
+	s->world.indx_mark       = db.indx_size;
+	s->world.water_mesh_mark = wdb.num_meshes;
+	s->world.water_geom_mark = wdb.geom_size;
+	s->world.water_indx_mark = wdb.indx_size;
+	s->world.first_prop      = s->num_props;
+
+	world_stream(&s->world, cx, cz, world_config, renderer, &s->phys, collision);
+	world_add_props(s, &s->world);
+}
+
+// a plain chunk crossing : keep the meshes the gpu already has and rebuild only
+// the chunks whose neighbour set changed
+void world_stream_update(Scene* s, GameRenderer* renderer, int cx, int cz)
+{
+	s->num_props = s->world.first_prop;
+	world_stream(&s->world, cx, cz, world_config, renderer, &s->phys, false);
+	world_add_props(s, &s->world);
+}
+
+// block drops : a small falling cube that settles on the ground and is picked
+// up when the player comes close
+void world_spawn_drop(Scene* s, int x, int y, int z, uint8 block)
+{
+	if (!block || !s->drop_mesh) return;
+	for (uint i = 0; i < 256; i++)
+	{
+		Scene::Drop& d = s->drops[i];
+		if (d.active) continue;
+		uint h = world_hash2(x, z, (uint)block * 31u + 7u);
+		d.active = true;
+		d.block  = block;
+		d.age    = 0.f;
+		d.pos    = vec3((float)x + .5f, (float)y + .35f, (float)z + .5f);
+		d.vel    = vec3(((h & 255u) / 255.f - .5f) * 1.4f, 2.2f,
+		                (((h >> 8) & 255u) / 255.f - .5f) * 1.4f);
+		return;
+	}
+}
+
+void world_update_drops(Scene* s, float dt)
+{
+	if (!s->world.built) return;
+	if (dt > .05f) dt = .05f;
+	vec3 player = s->player.voxel_mode ? s->player.voxel_pos : s->camera.position;
+
+	for (uint i = 0; i < 256; i++)
+	{
+		Scene::Drop& d = s->drops[i];
+		if (!d.active) continue;
+
+		d.age += dt;
+		d.vel.y -= 24.f * dt;
+		vec3 p = d.pos;
+		vec3 next = p + d.vel * dt;
+
+		int bx = world_floor(next.x), by = world_floor(next.y), bz = world_floor(next.z);
+		if (world_block_solid(world_get_block(&s->world, bx, by, bz)))
+		{
+			next.y = (float)by + 1.f + .09f;
+			d.vel.y = 0.f;
+			d.vel.x *= .72f;
+			d.vel.z *= .72f;
+		}
+
+		int hy = world_floor(p.y);
+		if (world_block_solid(world_get_block(&s->world, world_floor(next.x), hy, world_floor(p.z))))
+		{
+			next.x = p.x;
+			d.vel.x = 0.f;
+		}
+		if (world_block_solid(world_get_block(&s->world, world_floor(p.x), hy, world_floor(next.z))))
+		{
+			next.z = p.z;
+			d.vel.z = 0.f;
+		}
+
+		d.pos = next;
+		if (d.age > .3f && length(d.pos - (player + vec3(0, .9f, 0))) < 1.9f)
+		{
+			if (s->player.add_item(d.block)) d.active = false;
+		}
+		if (d.pos.y < -10.f) d.active = false;
+	}
+}
+
+void world_append_drop_props(Scene* s)
+{
+	if (!s->drop_mesh) return;
+	for (uint i = 0; i < 256; i++)
+	{
+		Scene::Drop& d = s->drops[i];
+		if (!d.active) continue;
+		Scene::Prop& p = s->add_prop(s->drop_mesh, d.pos, d.age * 2.2f, 1.f);
+		p.mat_a = vec4(WORLD_BLOCKS[d.block].albedo, 0.f);
+		p.mat_b = vec4(.80f, 1.f, 0.f, 0.f);
+	}
+}
+
+void world_scene_update(Scene* s, GameRenderer* renderer, float dt)
+{
+	s->world.water_time += dt;
+
+	// terrain lab : a slider changed the generator, so drop every chunk and let
+	// the full rebuild path regenerate the view with the new settings
+	if (s->world_dirty)
+	{
+		s->world_dirty = false;
+		for (uint i = 0; i < WORLD_MAX_CHUNKS; i++)
+			if (s->world.chunks[i].used) world_unload_chunk(&s->world.chunks[i]);
+		s->world.num_chunks = 0;
+		s->world.need_compact = true;
+		s->world.render_offset_y = -world_config.sea_level;
+	}
+
+	if (!s->player.voxel_mode && !s->player.body && !s->player.flycam) return;
+
+	vec3 pos;
+	if (s->player.flycam)            pos = s->camera.position;
+	else if (s->player.voxel_mode)   pos = s->player.voxel_pos;
+	else                             pos = s->phys.get_position(s->player.body);
+
+	int cx = world_chunk_coord(pos.x);
+	int cz = world_chunk_coord(pos.z);
+	if (!s->world.built || s->world.need_compact || s->world.stream_pending ||
+	    cx != s->world.center_cx || cz != s->world.center_cz)
+	{
+		if (!s->world.built || s->world.need_compact)
+			world_stream_rebuild(s, renderer, cx, cz, false);
+		else
+			world_stream_update(s, renderer, cx, cz);
+	}
+
+	world_update_drops(s, dt);
+	s->num_props = s->drop_prop_start;
+	world_append_drop_props(s);
+}
+
+// ---- voxel player collision ------------------------------------------------
+
+bool voxel_blocked(World* w, vec3 feet)
+{
+	const float r = .30f;
+	const float h = 1.80f;
+	int x0 = world_floor(feet.x - r), x1 = world_floor(feet.x + r - 1e-4f);
+	int y0 = world_floor(feet.y),      y1 = world_floor(feet.y + h - 1e-4f);
+	int z0 = world_floor(feet.z - r), z1 = world_floor(feet.z + r - 1e-4f);
+
+			for (int y = y0; y <= y1; y++)
+				for (int z = z0; z <= z1; z++)
+					for (int x = x0; x <= x1; x++)
+						if (world_block_solid(world_get_block(w, x, y, z)))
+							return true;
+			return false;
+}
+
+void player_update_voxel(Player* p, GameWindow* window, World* w)
+{
+	ImGuiIO& io = ImGui::GetIO();
+	float dt = fminf(window->dtime, .05f);
+
+	if (p->inventory_input(window)) return;
+	p->arm_swing *= expf(-12.f * dt);
+
+	if (p->has_inventory && window->focus_status == GAME && !io.WantCaptureKeyboard &&
+	    window->keys.F.is_pressed && !window->keys.F.was_pressed)
+		p->flycam = !p->flycam;
+
+	if (p->flycam)
+	{
+		update_fly_camera(&p->camera, window, dt, 1.f);
+		return;
+	}
+
+	if (window->focus_status == GAME && !io.WantCaptureMouse)
+		p->camera.update_dir((float)window->mouse.dx, (float)window->mouse.dy, dt);
+
+	vec3 fwd   = normalize(vec3(p->camera.front.x, 0, p->camera.front.z));
+	vec3 right = normalize(vec3(p->camera.right.x, 0, p->camera.right.z));
+
+	vec3 wish = vec3(0);
+	if (window->keys.W.is_pressed) wish += fwd;
+	if (window->keys.S.is_pressed) wish -= fwd;
+	if (window->keys.D.is_pressed) wish += right;
+	if (window->keys.A.is_pressed) wish -= right;
+	if (length(wish) > 0) wish = normalize(wish);
+
+	float speed = 4.3f * (window->keys.SHIFT.is_pressed ? 1.8f : 1.f);
+	float accel = p->voxel_grounded ? 14.f : 4.f;
+	p->voxel_vel.x += (wish.x * speed - p->voxel_vel.x) * (1.f - expf(-accel * dt));
+	p->voxel_vel.z += (wish.z * speed - p->voxel_vel.z) * (1.f - expf(-accel * dt));
+	p->voxel_vel.y -= 28.f * dt;
+
+	if (p->voxel_grounded && window->keys.SPACE.is_pressed && !window->keys.SPACE.was_pressed)
+		p->voxel_vel.y = 8.2f;
+
+	vec3 move = p->voxel_vel * dt;
+	uint steps = (uint)ceilf(fmaxf(fabsf(move.x), fmaxf(fabsf(move.y), fabsf(move.z))) / .18f);
+	if (steps < 1) steps = 1;
+
+	bool grounded = false;
+	for (uint i = 0; i < steps; i++)
+	{
+		vec3 step = move / (float)steps;
+
+		// x and z, with a short step-up attempt on a horizontal block
+		vec3 before = p->voxel_pos;
+		p->voxel_pos.x += step.x;
+		if (voxel_blocked(w, p->voxel_pos))
+		{
+			vec3 raised = before;
+			raised.y += 1.02f;
+			raised.x += step.x;
+			if (p->voxel_grounded && !voxel_blocked(w, raised))
+				p->voxel_pos = raised;
+			else
+			{
+				p->voxel_pos = before;
+				p->voxel_vel.x = 0.f;
+			}
+		}
+
+		before = p->voxel_pos;
+		p->voxel_pos.z += step.z;
+		if (voxel_blocked(w, p->voxel_pos))
+		{
+			vec3 raised = before;
+			raised.y += 1.02f;
+			raised.z += step.z;
+			if (p->voxel_grounded && !voxel_blocked(w, raised))
+				p->voxel_pos = raised;
+			else
+			{
+				p->voxel_pos = before;
+				p->voxel_vel.z = 0.f;
+			}
+		}
+
+		before = p->voxel_pos;
+		p->voxel_pos.y += step.y;
+		if (voxel_blocked(w, p->voxel_pos))
+		{
+			p->voxel_pos = before;
+			if (step.y < 0.f)
+			{
+				grounded = true;
+				p->voxel_vel.y = 0.f;
+			}
+			else
+				p->voxel_vel.y = 0.f;
+		}
+	}
+
+	// the last downward step can end a hair above the floor : probe just below
+	if (!grounded && p->voxel_vel.y <= 0.f && voxel_blocked(w, p->voxel_pos - vec3(0, .06f, 0)))
+		grounded = true;
+
+	p->voxel_grounded = grounded;
+	p->grounded = grounded;
+
+	float walk = length(vec2(p->voxel_vel.x, p->voxel_vel.z));
+	p->bob += dt * (1.f + walk);
+	float amp = grounded ? fminf(walk / 4.3f, 1.f) : 0.f;
+	vec3 eye = p->voxel_pos + vec3(cosf(p->bob * 2.f) * .018f * amp,
+	                               1.62f + sinf(p->bob * 4.f) * .022f * amp, 0);
+
+	if (p->third_person)
+		p->camera.position = eye - p->camera.front * 5.0f + vec3(0, .50f, 0);
+	else
+		p->camera.position = eye;
+}
+
+// ---- block interaction : break with lmb, place with rmb --------------------
+void player_world_interact(Scene* s, GameWindow* window, GameRenderer* renderer)
+{
+	if (!s->player.has_inventory || s->player.inventory_open) return;
+	if (window->focus_status != GAME) return;
+
+	bool break_block = window->mouse.left_button.is_pressed &&
+	                   !window->mouse.left_button.was_pressed;
+	bool place_block = window->mouse.right_button.is_pressed &&
+	                   !window->mouse.right_button.was_pressed;
+	if (!break_block && !place_block) return;
+
+	World_Hit hit;
+	if (!world_raycast(&s->world, s->player.camera.position, s->player.camera.front, 6.f, &hit))
+		return;
+	if (!hit.hit) return;
+
+	bool changed = false;
+	int edit_x = hit.x, edit_z = hit.z;
+	if (break_block)
+	{
+		uint8 block = world_get_block(&s->world, hit.x, hit.y, hit.z);
+		if (block == WORLD_AIR) return;
+		if (world_set_block(&s->world, hit.x, hit.y, hit.z, WORLD_AIR))
+		{
+			world_spawn_drop(s, hit.x, hit.y, hit.z, block);
+			changed = true;
+		}
+	}
+	else
+	{
+		Player::Slot& slot = s->player.hotbar[s->player.selected];
+		if (slot.block == WORLD_AIR || slot.count == 0) return;
+
+		int x = hit.x + hit.nx;
+		int y = hit.y + hit.ny;
+		int z = hit.z + hit.nz;
+		if (world_get_block(&s->world, x, y, z) != WORLD_AIR) return;
+
+		// never seal the player inside the new cube
+		vec3 p = s->player.voxel_mode ? s->player.voxel_pos
+		                              : s->phys.get_position(s->player.body);
+		float bottom = s->player.voxel_mode ? p.y : p.y - .95f;
+		float top    = s->player.voxel_mode ? p.y + 1.8f : p.y + .95f;
+		if (x + 1.f > p.x - .45f && x < p.x + .45f &&
+		    y + 1.f > bottom && y < top &&
+		    z + 1.f > p.z - .45f && z < p.z + .45f)
+			return;
+
+		if (s->player.take_item(slot.block, 1))
+		{
+			if (world_set_block(&s->world, x, y, z, slot.block))
+			{
+				changed = true;
+				edit_x = x;
+				edit_z = z;
+			}
+			else
+				s->player.add_item(slot.block); // loaded check failed : give it back
+		}
+	}
+
+	if (!changed) return;
+
+	s->player.arm_swing = 1.f;
+	world_mark_block_dirty(&s->world, edit_x, edit_z);
+	if (!world_remesh_dirty(&s->world, renderer))
+		world_stream_rebuild(s, renderer, s->world.center_cx, s->world.center_cz, false);
+	else
+	{
+		// a type can appear or disappear in this chunk : refresh the prop list
+		// without touching the rest of the streamed view
+		s->num_props = s->world.first_prop;
+		world_add_props(s, &s->world);
+	}
+}
+
+// ---- placement preview : a wire box around the cell the next right click fills
+void world_append_placement_preview(Scene* s)
+{
+	if (!s->player.has_inventory || s->player.inventory_open || s->player.flycam) return;
+	if (s->player.hotbar[s->player.selected].block == WORLD_AIR) return;
+
+	World_Hit hit;
+	if (!world_raycast(&s->world, s->player.camera.position, s->player.camera.front, 6.f, &hit))
+		return;
+	if (!hit.hit) return;
+
+	int x = hit.x + hit.nx;
+	int y = hit.y + hit.ny;
+	int z = hit.z + hit.nz;
+	if (world_get_block(&s->world, x, y, z) != WORLD_AIR) return;
+
+	vec3 p = s->player.voxel_mode ? s->player.voxel_pos
+	                              : s->phys.get_position(s->player.body);
+	float bottom = s->player.voxel_mode ? p.y : p.y - .95f;
+	float top    = s->player.voxel_mode ? p.y + 1.8f : p.y + .95f;
+	if (x + 1.f > p.x - .45f && x < p.x + .45f &&
+	    y + 1.f > bottom && y < top &&
+	    z + 1.f > p.z - .45f && z < p.z + .45f)
+		return;
+
+	vec3 c = WORLD_BLOCKS[s->player.hotbar[s->player.selected].block].albedo;
+	vec4 outline = vec4(fminf(.45f + c.x * .55f, 1.f),
+	                    fminf(.45f + c.y * .55f, 1.f),
+	                    fminf(.45f + c.z * .55f, 1.f), 1.f);
+	mat4 model = glm::translate(mat4(1), vec3(x + .5f, y + .5f, z + .5f))
+	           * glm::scale(mat4(1), vec3(.502f)); // box_mesh is -1..1, so half-size + a hair
+	debug_draw.append_shape(debug_draw.box_mesh, model, outline);
+}
+
+// ---- hotbar and inventory overlay ------------------------------------------
+ImU32 world_block_color(uint block)
+{
+	if (block == 0 || block >= WORLD_BLOCK_COUNT) return IM_COL32(32, 34, 38, 255);
+	vec3 c = WORLD_BLOCKS[block].albedo;
+	return IM_COL32((int)(c.x * 255.f), (int)(c.y * 255.f), (int)(c.z * 255.f), 255);
+}
+
+// a small block icon : top diamond, left face, right face. no textures, but the
+// three shades are enough to read as a cube in the inventory
+void draw_block_icon(ImDrawList* dl, ImVec2 center, float size, uint block)
+{
+	if (block == 0 || block >= WORLD_BLOCK_COUNT) return;
+
+	vec3 c = WORLD_BLOCKS[block].albedo;
+	ImU32 top   = IM_COL32((int)(fminf(c.x * 1.25f, 1.f) * 255.f),
+	                       (int)(fminf(c.y * 1.25f, 1.f) * 255.f),
+	                       (int)(fminf(c.z * 1.25f, 1.f) * 255.f), 255);
+	ImU32 left  = IM_COL32((int)(c.x * 255.f), (int)(c.y * 255.f), (int)(c.z * 255.f), 255);
+	ImU32 right = IM_COL32((int)(c.x * .68f * 255.f), (int)(c.y * .68f * 255.f),
+	                       (int)(c.z * .68f * 255.f), 255);
+
+	float w = size * .30f;
+	float h = size * .18f;
+	ImVec2 p0(center.x, center.y - h * 2.0f);
+	ImVec2 p1(center.x + w, center.y - h * .95f);
+	ImVec2 p2(center.x, center.y + h * .10f);
+	ImVec2 p3(center.x - w, center.y - h * .95f);
+	ImVec2 bl(p3.x, p3.y + size * .28f);
+	ImVec2 bm(p2.x, p2.y + size * .28f);
+	ImVec2 br(p1.x, p1.y + size * .28f);
+
+	dl->AddQuadFilled(p0, p1, p2, p3, top);
+	dl->AddQuadFilled(p3, p2, bm, bl, left);
+	dl->AddQuadFilled(p2, p1, br, bm, right);
+}
+
+void draw_slot(ImDrawList* dl, ImVec2 a, float size, float scale)
+{
+	ImVec2 b(a.x + size, a.y + size);
+	dl->AddRectFilled(a, b, IM_COL32(139, 139, 139, 255));
+	dl->AddRectFilled(a, ImVec2(b.x, a.y + 2.f * scale), IM_COL32(55, 55, 55, 255));
+	dl->AddRectFilled(a, ImVec2(a.x + 2.f * scale, b.y), IM_COL32(55, 55, 55, 255));
+	dl->AddRectFilled(ImVec2(a.x, b.y - 2.f * scale), b, IM_COL32(215, 215, 215, 255));
+	dl->AddRectFilled(ImVec2(b.x - 2.f * scale, a.y), b, IM_COL32(215, 215, 215, 255));
+}
+
+void draw_stack(ImDrawList* dl, ImVec2 a, float size, uint block, uint count, float scale)
+{
+	if (!block || !count) return;
+	draw_block_icon(dl, ImVec2(a.x + size * .5f, a.y + size * .52f), size * .78f, block);
+	if (count > 1)
+	{
+		char text[8];
+		snprintf(text, sizeof(text), "%u", count);
+		ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(15.f * scale, 9999.f, 0.f, text);
+		ImVec2 at(a.x + size - ts.x - 3.f * scale, a.y + size - ts.y - 1.f * scale);
+		dl->AddText(ImGui::GetFont(), 15.f * scale, ImVec2(at.x + 1.f, at.y + 1.f),
+		            IM_COL32(0, 0, 0, 220), text);
+		dl->AddText(ImGui::GetFont(), 15.f * scale, at, IM_COL32(255, 255, 255, 255), text);
+	}
+}
+
+void draw_hotbar(Scene* s, GameWindow* window)
+{
+	ImDrawList* dl = ImGui::GetBackgroundDrawList();
+	float scale = window->screen_height / 1080.f;
+	float panel = ux_panel_visible ? ux_panel_width(window) : 0.f;
+	float cx = (window->screen_width + panel) * .5f;
+
+	const float slot = 50.f * scale;
+	const float gap  = 2.f * scale;
+	float total = 9.f * slot + 8.f * gap;
+	float x0 = cx - total * .5f;
+	float y0 = window->screen_height - 104.f * scale;
+
+	Player::Slot& sel = s->player.hotbar[s->player.selected];
+	if (sel.block)
+	{
+		const char* name = WORLD_BLOCKS[sel.block].name;
+		ImVec2 size = ImGui::GetFont()->CalcTextSizeA(14.f * scale, 9999.f, 0.f, name);
+		dl->AddText(ImGui::GetFont(), 14.f * scale,
+		            ImVec2(cx - size.x * .5f, y0 - 24.f * scale),
+		            IM_COL32(255, 255, 255, 235), name);
+	}
+
+	for (uint i = 0; i < 9; i++)
+	{
+		ImVec2 a(x0 + (slot + gap) * (float)i, y0);
+		draw_slot(dl, a, slot, scale);
+		draw_stack(dl, a, slot, s->player.hotbar[i].block, s->player.hotbar[i].count, scale);
+		if (i == s->player.selected)
+			dl->AddRect(ImVec2(a.x - 2.f * scale, a.y - 2.f * scale),
+			            ImVec2(a.x + slot + 2.f * scale, a.y + slot + 2.f * scale),
+			            IM_COL32(255, 255, 255, 255), 1.f, 0, 2.f * scale);
+	}
+}
+
+// ---- inventory : vanilla 176 x 166 layout --------------------------------
+//
+// Minecraft's player screen is a 176 x 166 panel : 2 x 2 crafting grid and
+// result at the top right, four armour slots down the left, an offhand slot,
+// 27 storage slots and a nine-slot hotbar. The proportions and slot pitch here
+// are the vanilla ones ; the panel is drawn from flat colours, no GUI texture.
+
+Player::Slot inventory_craft_result(Player& p)
+{
+	uint wood = 0, other = 0;
+	for (uint i = 0; i < 4; i++)
+	{
+		Player::Slot& s = p.craft[i];
+		if (!s.block || !s.count) continue;
+		if (s.block == WORLD_WOOD) wood += s.count;
+		else other += s.count;
+	}
+	if (other || wood == 0) return {};
+	return { WORLD_PLANKS, 4 };
+}
+
+void inventory_craft_consume(Player& p)
+{
+	for (uint i = 0; i < 4; i++)
+	{
+		if (p.craft[i].block != WORLD_WOOD || !p.craft[i].count) continue;
+		if (--p.craft[i].count == 0) p.craft[i].block = 0;
+		return;
+	}
+}
+
+void draw_inventory(Scene* s, GameWindow* window)
+{
+	if (!s->player.inventory_open) return;
+
+	ImGuiIO& io = ImGui::GetIO();
+	float ui = window->screen_height / 1080.f;
+	float G = 3.f * ui;                 // one Minecraft GUI pixel
+	const float W = 176.f * G, H = 166.f * G;
+	const float S = 18.f * G;
+
+	ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * .5f, io.DisplaySize.y * .5f),
+	                        ImGuiCond_Always, ImVec2(.5f, .5f));
+	ImGui::SetNextWindowSize(ImVec2(W, H));
+	ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+	                       | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+	                       | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground;
+	if (!ImGui::Begin("##inventory", NULL, flags)) { ImGui::End(); return; }
+
+	ImVec2 origin = ImGui::GetWindowPos();
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+	ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 145));
+
+	// flat dark panel with the pause menu's warm orange accent
+	const ImU32 orange = IM_COL32(226, 150, 58, 255);
+	const ImU32 orange_dim = IM_COL32(170, 112, 46, 255);
+	dl->AddRectFilled(origin, ImVec2(origin.x + W, origin.y + H), IM_COL32(14, 14, 16, 252));
+	dl->AddRect(origin, ImVec2(origin.x + W, origin.y + H), orange, 0, 0, 2.f * G);
+	dl->AddRect(ImVec2(origin.x + 3.f * G, origin.y + 3.f * G),
+	            ImVec2(origin.x + W - 3.f * G, origin.y + H - 3.f * G),
+	            IM_COL32(54, 42, 28, 255), 0, 0, 1.f * G);
+
+	dl->AddText(ImGui::GetFont(), 15.f * ui, ImVec2(origin.x + 96.f * G, origin.y + 4.f * G),
+	            orange, "Crafting");
+	dl->AddText(ImGui::GetFont(), 15.f * ui, ImVec2(origin.x + 8.f * G, origin.y + 70.f * G),
+	            orange, "Inventory");
+	dl->AddText(ImGui::GetFont(), 11.f * ui, ImVec2(origin.x + W - 40.f * G, origin.y + 5.f * G),
+	            orange_dim, "E close");
+
+
+	int hover = -1;
+	auto slot_pos = [&](float lx, float ly) {
+		return ImVec2(origin.x + lx * G, origin.y + ly * G);
+	};
+	auto slot_style = [&](ImVec2 a, bool hot) {
+		dl->AddRectFilled(a, ImVec2(a.x + S, a.y + S), IM_COL32(24, 24, 27, 255));
+		dl->AddRect(a, ImVec2(a.x + S, a.y + S),
+		            hot ? orange : IM_COL32(58, 58, 64, 255), 0, 0, 1.f * G);
+	};
+
+	auto draw_slot_at = [&](int index, float lx, float ly) {
+		ImVec2 a = slot_pos(lx, ly);
+		ImGui::SetCursorScreenPos(a);
+		ImGui::PushID(index);
+		ImGui::InvisibleButton("##slot", ImVec2(S, S));
+		bool clicked = ImGui::IsItemClicked(0);
+		bool hovered = ImGui::IsItemHovered();
+		ImGui::PopID();
+
+		slot_style(a, hovered);
+		Player::Slot* ps = s->player.slot_at(index);
+		if (ps) draw_stack(dl, a, S, ps->block, ps->count, ui);
+
+		if (index < 9 && s->player.selected == (uint)index)
+			dl->AddRect(ImVec2(a.x - 1.f * G, a.y - 1.f * G),
+			            ImVec2(a.x + S + 1.f * G, a.y + S + 1.f * G),
+			            orange, 1.f, 0, 2.f * G);
+
+		if (clicked)
+		{
+			s->player.slot_click(index);
+			if (index < 9) s->player.selected = (uint)index;
+		}
+		if (hovered) hover = index;
+	};
+
+	// armour, offhand, 2 x 2 crafting grid
+	for (int i = 0; i < 4; i++) draw_slot_at(40 + i, 8.f, 8.f + (float)i * 18.f);
+	draw_slot_at(44, 77.f, 62.f);
+
+	// faint slot silhouettes, as in the vanilla panel
+	ImU32 ghost = IM_COL32(98, 74, 48, 120);
+	for (int i = 0; i < 4; i++)
+	{
+		if (s->player.armor[i].block) continue;
+		ImVec2 a = slot_pos(8.f, 8.f + (float)i * 18.f);
+		float cx = a.x + S * .5f;
+		if (i == 0)
+			dl->AddRectFilled(ImVec2(cx - 7.f * G, a.y + 8.f * G), ImVec2(cx + 7.f * G, a.y + 15.f * G), ghost);
+		else if (i == 1)
+			dl->AddRectFilled(ImVec2(cx - 8.f * G, a.y + 7.f * G), ImVec2(cx + 8.f * G, a.y + 17.f * G), ghost);
+		else if (i == 2)
+		{
+			dl->AddRectFilled(ImVec2(cx - 7.f * G, a.y + 6.f * G), ImVec2(cx - 1.f * G, a.y + 18.f * G), ghost);
+			dl->AddRectFilled(ImVec2(cx + 1.f * G, a.y + 6.f * G), ImVec2(cx + 7.f * G, a.y + 18.f * G), ghost);
+		}
+		else
+		{
+			dl->AddRectFilled(ImVec2(cx - 8.f * G, a.y + 12.f * G), ImVec2(cx - 1.f * G, a.y + 17.f * G), ghost);
+			dl->AddRectFilled(ImVec2(cx + 1.f * G, a.y + 12.f * G), ImVec2(cx + 8.f * G, a.y + 17.f * G), ghost);
+		}
+	}
+	{
+		if (!s->player.offhand.block)
+		{
+			ImVec2 a = slot_pos(77.f, 62.f);
+			float cx = a.x + S * .5f, cy = a.y + S * .5f;
+			dl->AddRectFilled(ImVec2(cx - 7.f * G, cy - 7.f * G), ImVec2(cx + 7.f * G, cy + 7.f * G), ghost);
+		}
+	}
+
+	draw_slot_at(36, 98.f, 18.f);
+	draw_slot_at(37, 116.f, 18.f);
+	draw_slot_at(38, 98.f, 36.f);
+	draw_slot_at(39, 116.f, 36.f);
+
+	// craft result
+	Player::Slot result = inventory_craft_result(s->player);
+	ImVec2 ra = slot_pos(154.f, 28.f);
+	ImGui::SetCursorScreenPos(ra);
+	ImGui::PushID(100);
+	ImGui::InvisibleButton("##result", ImVec2(S, S));
+	bool result_clicked = ImGui::IsItemClicked(0);
+	bool result_hovered = ImGui::IsItemHovered();
+	ImGui::PopID();
+	slot_style(ra, result_hovered);
+	if (result.block)
+	{
+		draw_stack(dl, ra, S, result.block, result.count, ui);
+		if (result_hovered)
+			dl->AddRect(ImVec2(ra.x - 2.f * G, ra.y - 2.f * G),
+			            ImVec2(ra.x + S + 2.f * G, ra.y + S + 2.f * G),
+			            orange, 1.f, 0, 2.f * G);
+	}
+
+	// arrow from grid to result
+	dl->AddLine(ImVec2(origin.x + 136.f * G, origin.y + 33.f * G),
+	            ImVec2(origin.x + 146.f * G, origin.y + 37.f * G), orange, 2.f * G);
+	dl->AddLine(ImVec2(origin.x + 146.f * G, origin.y + 37.f * G),
+	            ImVec2(origin.x + 136.f * G, origin.y + 41.f * G), orange, 2.f * G);
+
+	if (result_clicked && result.block)
+	{
+		if (s->player.drag_stack.block == 0)
+		{
+			s->player.drag_stack = { result.block, result.count };
+			inventory_craft_consume(s->player);
+			s->player.drag_source = -1;
+		}
+		else if (s->player.drag_stack.block == result.block &&
+		         s->player.drag_stack.count + result.count <= 64)
+		{
+			s->player.drag_stack.count += result.count;
+			inventory_craft_consume(s->player);
+		}
+	}
+
+	// 27 storage slots, then the hotbar
+	for (int row = 0; row < 3; row++)
+		for (int col = 0; col < 9; col++)
+			draw_slot_at(9 + row * 9 + col, 8.f + (float)col * 18.f, 84.f + (float)row * 18.f);
+	for (int col = 0; col < 9; col++)
+		draw_slot_at(col, 8.f + (float)col * 18.f, 142.f);
+
+	// drag : release over a different slot drops the cursor stack there
+	if (hover >= 0 && s->player.drag_stack.block && s->player.drag_source != hover &&
+	    ImGui::IsMouseReleased(0))
+		s->player.slot_click(hover);
+
+	if (s->player.drag_stack.block && s->player.drag_stack.count)
+	{
+		ImVec2 m = io.MousePos;
+		draw_block_icon(dl, ImVec2(m.x, m.y), S * .78f, s->player.drag_stack.block);
+		if (s->player.drag_stack.count > 1)
+		{
+			char text[8];
+			snprintf(text, sizeof(text), "%u", s->player.drag_stack.count);
+			dl->AddText(ImGui::GetFont(), 13.f * ui, ImVec2(m.x + 5.f * G, m.y + 2.f * G),
+			            IM_COL32(255, 255, 255, 255), text);
+		}
+	}
+	else if (hover >= 0)
+	{
+		Player::Slot* ps = s->player.slot_at(hover);
+		if (ps && ps->block)
+		{
+			const char* name = WORLD_BLOCKS[ps->block].name;
+			ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(14.f * ui, 9999.f, 0.f, name);
+			ImVec2 m = ImVec2(io.MousePos.x + 14.f * G, io.MousePos.y - 6.f * G);
+			dl->AddRectFilled(ImVec2(m.x - 4.f * G, m.y - 2.f * G),
+			                  ImVec2(m.x + ts.x + 4.f * G, m.y + ts.y + 2.f * G),
+			                  IM_COL32(14, 14, 16, 240));
+			dl->AddRect(ImVec2(m.x - 4.f * G, m.y - 2.f * G),
+			            ImVec2(m.x + ts.x + 4.f * G, m.y + ts.y + 2.f * G),
+			            orange_dim, 0, 0, 1.f * G);
+			dl->AddText(ImGui::GetFont(), 14.f * ui, m, IM_COL32(255, 255, 255, 255), name);
+		}
+	}
+
+	ImGui::End();
+
+	if (!s->player.inventory_open)
+	{
+		s->player.drag_stack = {};
+		s->player.drag_source = -1;
+		window->ui_lock = false;
+		window->set_focus(GAME);
+	}
+}
+
 // the hero sphere's live material : the builder fills the handle, the debug
 // tab edits the values and applies them to the prop
 struct Render_Controls
@@ -665,10 +1504,18 @@ void water_bind_window(GameWindow* window, float time)
 {
 	window->water_foam_color     = water_config.foam_albedo;
 	window->water_foam_roughness = water_config.foam_roughness;
+	window->water_shore_foam     = 1.f;
+	window->water_sun            = .15f;
 	window->water_normal_tx      = water_view.detail_tx;
-	window->water_detail         = water_config.detail;
+	window->water_detail         = water_config.detail * .30f;
+	window->water_chop           = .050f;
 	window->water_sss            = water_config.sss;
 	window->water_time           = time;
+	window->water_absorb         = vec3(.30f, .08f, .035f);
+	window->water_underwater     = true;
+	window->water_level          = water_view.level;
+	window->underwater_color     = vec3(.010f, .070f, .200f);
+	window->underwater_density   = .070f;
 }
 
 // the shallow patch has no second cascade : its mesh normals are the whole wave
@@ -676,10 +1523,52 @@ void shallow_bind_window(GameWindow* window, float time)
 {
 	window->water_foam_color     = vec3(.82f, .88f, .90f);
 	window->water_foam_roughness = .55f;
+	window->water_shore_foam     = .55f;
+	window->water_sun            = .12f;
 	window->water_normal_tx      = 0;
 	window->water_detail         = 0.f;
+	window->water_chop           = .18f;
 	window->water_sss            = shallow_config.sss;
 	window->water_time           = time;
+	window->water_absorb         = vec3(.42f, .12f, .040f);
+	window->water_underwater     = true;
+	window->water_level          = shallow_config.level;
+	window->underwater_color     = vec3(.010f, .090f, .260f);
+	window->underwater_density   = .120f;
+}
+
+static Water_Detail world_water_detail;
+static uint         world_water_normal_tx;
+
+void world_water_init(GameRenderer* renderer)
+{
+	Water_Config wc = water_config;
+	wc.seed       = world_config.seed;
+	wc.wind_speed = 7.f;
+	wc.detail     = .60f;
+
+	water_build_detail(&world_water_detail, wc);
+	water_update_detail(&world_water_detail, 0.f);
+
+	world_water_normal_tx = renderer->txloader.create_dynamic_rg(
+		"world_water_detail", world_water_detail.n, world_water_detail.n);
+	renderer->txloader.upload_dynamic_rg(
+		world_water_normal_tx, world_water_detail.normals,
+		world_water_detail.n, world_water_detail.n);
+}
+
+void world_water_bind_window(GameWindow* window, float time)
+{
+	window->water_foam_color     = vec3(.55f, .72f, .80f);
+	window->water_foam_roughness = .55f;
+	window->water_shore_foam     = .30f;
+	window->water_sun            = .12f;
+	window->water_normal_tx      = world_water_normal_tx;
+	window->water_detail         = .14f;
+	window->water_chop           = .050f;
+	window->water_sss            = .22f;
+	window->water_time           = time;
+	window->water_absorb         = vec3(.28f, .07f, .030f);
 }
 
 // ---- water : one fft patch tiled into open sea
@@ -776,39 +1665,140 @@ void shallow_append_geometry(Scene* s, GameRenderer* renderer)
 	mesh.release();
 }
 
-// ---- shallow : the finite-difference patch in a stone basin
-void scene_shallow(Scene* s, GameRenderer* renderer)
+// ---- shallow : the finite-difference patch in a sand basin -----------------
+
+// a smooth sand bowl under the water plane. the finite-difference patch is a
+// square, but nothing says its bottom has to be : a continuous surface gives the
+// refraction something to read, and the rim blocks hide the
+// patch edge
+uint shallow_basin_mesh(GameRenderer* renderer)
 {
-	s->begin(renderer, vec3(0, 5.5f, 9.f), -PI / 2, -0.35f, 20.f, 10.f, 4, .5f);
-	s->shadow_extent = 20.f;
-	s->use_lighting(LIGHT_CARIBBEAN);
+	const int n = 48;
+	const float half = 4.35f;
+	Mesh_Data mesh = {};
+	mesh.num_vertices = n * n;
+	mesh.num_indices  = (n - 1) * (n - 1) * 6;
+	mesh.positions = Alloc(vec3, mesh.num_vertices);
+	mesh.normals   = Alloc(vec3, mesh.num_vertices);
+	mesh.uvs       = Alloc(vec2, mesh.num_vertices);
+	mesh.indices   = Alloc(uint, mesh.num_indices);
 
-	Scene::Prop& floor = s->props[0];
-	floor.mat_a = vec4(.46f, .40f, .30f, 0.f);
-	floor.mat_b = vec4(.92f, 1.f, 0.f, 0.f);
-
-	uint cube = renderer->add_mesh(MeshFactory::generate_cube(1.f));
-
-	// four stone walls : inner opening is the 8 x 8 water patch
-	struct Wall { vec3 pos, scale; };
-	const Wall walls[4] = {
-		{ vec3(0, 1.35f,  4.3f), vec3(9.2f, 1.7f, .6f) },
-		{ vec3(0, 1.35f, -4.3f), vec3(9.2f, 1.7f, .6f) },
-		{ vec3( 4.3f, 1.35f, 0), vec3(.6f, 1.7f, 9.2f) },
-		{ vec3(-4.3f, 1.35f, 0), vec3(.6f, 1.7f, 9.2f) },
+	auto basin_height = [](float x, float z)
+	{
+		float r = sqrtf(x * x + z * z);
+		float t = fminf(r / 4.30f, 1.f);
+		float s = t * t * (3.f - 2.f * t);
+		float y = .55f + .92f * s;
+		y += .025f * sinf(x * 2.3f + sinf(z * 1.9f)) * sinf(z * 2.7f + .8f) * (1.f - .5f * s);
+		return y;
 	};
 
+	float cell = 2.f * half / (float)(n - 1);
+	for (int z = 0; z < n; z++)
+		for (int x = 0; x < n; x++)
+		{
+			float px = -half + (float)x * cell;
+			float pz = -half + (float)z * cell;
+			float y  = basin_height(px, pz);
+			float e  = .05f;
+			float hx = basin_height(px + e, pz) - basin_height(px - e, pz);
+			float hz = basin_height(px, pz + e) - basin_height(px, pz - e);
+
+			uint i = (uint)(z * n + x);
+			mesh.positions[i] = vec3(px, y, pz);
+			mesh.normals[i]   = normalize(vec3(-hx / (2.f * e), 1.f, -hz / (2.f * e)));
+			mesh.uvs[i]       = vec2((float)x / (float)(n - 1), (float)z / (float)(n - 1));
+		}
+
+	uint index = 0;
+	for (int z = 0; z < n - 1; z++)
+		for (int x = 0; x < n - 1; x++)
+		{
+			uint a = (uint)(z * n + x);
+			uint b = a + 1;
+			uint c = a + (uint)n;
+			uint d = c + 1;
+			mesh.indices[index++] = a; mesh.indices[index++] = c; mesh.indices[index++] = d;
+			mesh.indices[index++] = a; mesh.indices[index++] = d; mesh.indices[index++] = b;
+		}
+
+	return renderer->add_mesh(mesh);
+}
+
+void scene_shallow(Scene* s, GameRenderer* renderer)
+{
+	s->begin(renderer, vec3(0.f, 4.2f, 7.2f), -PI / 2.f, -.43f, 24.f, 12.f, 4, .35f);
+	s->shadow_extent = 18.f;
+	s->use_lighting(LIGHT_CARIBBEAN);
+	s->lighting.fog_density = .0009f;
+
+	// warm bounce from the sand : the preset's blue side light turns every
+	// unlit sand face green, which is the one thing a beach cannot do
+	s->lighting.ambient_side = vec3(.52f, .46f, .36f);
+	s->lighting.ambient_down = vec3(.20f, .16f, .12f);
+
+	Scene::Prop& floor = s->props[0];
+	floor.mat_a = vec4(.50f, .42f, .28f, 0.f); // dry sand around the pool
+	floor.mat_b = vec4(.90f, 1.f, 0.f, 0.f);
+
+	uint cube  = renderer->add_mesh(MeshFactory::generate_cube(1.f));
+	uint stone = renderer->add_mesh(MeshFactory::generate_uv_sphere(.5f, 14, 9));
+
+	// the smooth bowl under the water
+	Scene::Prop& bed = s->add_prop(shallow_basin_mesh(renderer), vec3(0), 0, 1.f);
+	bed.mat_a = vec4(.58f, .48f, .32f, 0.f);
+	bed.mat_b = vec4(.90f, 1.f, 0.f, 0.f);
+
+	// a shallow block beach around it. the inner ring sits above the water line
+	// and hides the square edge of the finite-difference patch
+	for (int z = -7; z <= 7; z++)
+		for (int x = -7; x <= 7; x++)
+		{
+			int ax = x < 0 ? -x : x;
+			int az = z < 0 ? -z : z;
+			int r = ax > az ? ax : az;
+			if (r < 4) continue; // the bowl covers the middle
+
+			float top;
+			if (r == 4)      top = 1.75f; // shore lip, above the 1.5 m water
+			else if (r == 5) top = 1.95f;
+			else if (r == 6) top = 1.20f;
+			else             top = .60f;
+
+			uint h = world_hash2(x, z, 17u);
+			// colour varies, height does not : a 1 cm step at every seam reads as
+			// a crack across the beach
+
+			Scene::Prop& p = s->add_prop(cube, vec3((float)x + .5f, top * .5f, (float)z + .5f),
+			                             0, vec3(1.f, top, 1.f));
+			float warm = .92f + (float)((h >> 4) % 7u) * .014f;
+			p.mat_a = vec4(.58f * warm, .48f * warm, .30f * warm, 0.f);
+			p.mat_b = vec4(.92f, 1.f, 0.f, 0.f);
+		}
+
+	// wet stones at the rim
+	struct Rock { vec3 pos; vec3 scale; float yaw; };
+	const Rock rocks[4] = {
+		{ vec3(-3.2f, 1.98f,  3.9f), vec3(1.15f, .70f, .95f),  .4f },
+		{ vec3( 4.3f, 1.92f,  2.2f), vec3(.85f, .60f, 1.05f), 1.1f },
+		{ vec3( 2.6f, 1.95f, -4.1f), vec3(1.30f, .55f, .90f), -.6f },
+		{ vec3(-4.6f, 1.65f, -2.7f), vec3(.75f, .50f, .70f),  .9f },
+	};
 	for (uint i = 0; i < 4; i++)
 	{
-		Scene::Prop& wall = s->add_prop(cube, walls[i].pos, 0, walls[i].scale);
-		wall.mat_a = vec4(.38f, .36f, .30f, 0.f);
-		wall.mat_b = vec4(.84f, 1.f, 0.f, 0.f);
-		s->phys.add_box(wall.pos, walls[i].scale * .5f, 0);
+		Scene::Prop& p = s->add_prop(stone, rocks[i].pos, rocks[i].yaw, rocks[i].scale);
+		p.mat_a = vec4(.34f, .31f, .27f, 0.f);
+		p.mat_b = vec4(.88f, .85f, 0.f, 0.f);
 	}
 
-	// the player is only a camera here; the basin is walkable if F is pressed
+	// the player is only a camera here
 	s->player.init(&s->phys, vec3(0, 2.4f, 7.f));
 	s->player.flycam = true;
+
+	shallow_config.level     = 1.5f;
+	shallow_config.albedo    = vec3(.040f, .180f, .320f);
+	shallow_config.roughness = .10f;
+	shallow_config.sss       = .12f;
 
 	shallow_build_content(s, renderer, vec3(0), shallow_config.level);
 
@@ -831,6 +1821,7 @@ void shallow_scene_update(Scene* s, GameRenderer* renderer, float dt)
 }
 
 void hud_text_center(ImDrawList* dl, float size, float center_x, float y, ImU32 color, const char* text);
+void hud_crosshair(ImDrawList* dl, float cx, float cy, float scale, ImU32 color);
 
 // ---- water : title, sea state and the tiles in view
 void scene_water_ux(Scene* s, GameWindow* window)
@@ -880,6 +1871,151 @@ void scene_shallow_ux(Scene* s, GameWindow* window)
 	hud_text_center(dl, 14.f * scale, cx, 70.f * scale, dim, sub);
 	hud_text_center(dl, 13.f * scale, cx, window->screen_height - 42.f * scale, dim,
 	                "WASD fly  |  mouse look  |  T console  |  drops + damping under Scenes");
+}
+
+// ---- world : the playable streaming voxel scene ----------------------------
+void scene_world(Scene* s, GameRenderer* renderer)
+{
+	s->begin(renderer, vec3(0.f, world_config.sea_level + 20.f, 0.f),
+	         -PI / 2.f, -.10f, 180.f, 90.f, 0, 0.f, false);
+	s->use_lighting(LIGHT_TRADE_WINDS);
+	s->lighting.fog_density = .0012f;
+	s->lighting.zenith = vec3(.03f, .18f, .52f);
+	s->lighting.haze   = vec3(.20f, .38f, .62f);
+	s->lighting.glow   = vec3(1.00f, .84f, .60f);
+	s->far_plane = 620.f;
+	s->shadow_extent = 220.f;
+	s->show_labels = false;
+	s->local_lights = false;
+	s->time_of_day = 9.f;
+	world_water_init(renderer);
+
+	static const uint start_blocks[9] = {
+		WORLD_GRASS, WORLD_DIRT, WORLD_STONE, WORLD_SAND, WORLD_SNOW,
+		WORLD_WOOD, WORLD_LEAVES, WORLD_TORCH, WORLD_LIGHT
+	};
+	static const uint start_counts[9] = { 64, 64, 64, 64, 64, 64, 64, 64, 64 };
+	s->player.start_inventory(renderer, start_blocks, start_counts, 9);
+	s->drop_mesh = renderer->add_mesh(MeshFactory::generate_cube(.18f));
+
+	world_stream_rebuild(s, renderer, 0, 0, false);
+
+	vec3 spawn;
+	world_spawn(&s->world, world_config, &spawn);
+	s->player.init_voxel(spawn);
+
+
+	// face the lowest cardinal direction : the first view looks downhill and
+	// across the landscape instead of straight into the next rise
+	float h_n = world_height_at(world_config, spawn.x, spawn.z - 8.f);
+	float h_s = world_height_at(world_config, spawn.x, spawn.z + 8.f);
+	float h_w = world_height_at(world_config, spawn.x - 8.f, spawn.z);
+	float h_e = world_height_at(world_config, spawn.x + 8.f, spawn.z);
+	float yaw = -PI / 2.f;
+	float low = h_n;
+	if (h_s < low) { low = h_s; yaw = PI / 2.f; }
+	if (h_e < low) { low = h_e; yaw = 0.f; }
+	if (h_w < low) { yaw = PI; }
+	s->player.camera.yaw   = yaw;
+	s->player.camera.pitch = -.04f;
+	s->player.camera.update_dir(0, 0, 0);
+
+	s->finish("world");
+}
+
+// ---- terrain : the same infinite chunk world from a free-fly camera ---------
+void scene_terrain(Scene* s, GameRenderer* renderer)
+{
+	s->begin(renderer, vec3(0.f, 40.f, 0.f),
+	         -PI / 2.f, -.20f, 256.f, 128.f, 0, 0.f, false);
+	s->use_lighting(LIGHT_TRADE_WINDS);
+	s->lighting.fog_density = .0012f; // keep the horizon readable, only haze the far edge
+	s->lighting.zenith = vec3(.03f, .18f, .52f);
+	s->lighting.haze   = vec3(.20f, .38f, .62f);
+	s->lighting.glow   = vec3(1.00f, .84f, .60f);
+	s->far_plane = 1200.f;
+	s->shadow_extent = 220.f;
+	s->show_labels = false;
+	s->local_lights = false;
+	s->fly_speed_scale = 8.f;
+	world_water_init(renderer);
+
+	// the lab renders the same 1 m voxel grid as the playable world, shifted so
+	// its sea line sits at world y 0
+	s->world.render_offset_y = -world_config.sea_level;
+	world_stream_rebuild(s, renderer, 0, 0, false);
+
+	vec3 spawn;
+	world_spawn(&s->world, world_config, &spawn);
+	s->player.init_voxel(spawn); // safe camera state, no bullet body
+	s->player.flycam = true;
+
+	s->camera.position = vec3(spawn.x,
+	                          spawn.y + s->world.render_offset_y + 26.f,
+	                          spawn.z);
+	s->camera.yaw   = -PI / 2.f;
+	s->camera.pitch = -.22f;
+	s->camera.update_dir(0, 0, 0);
+
+	s->finish("terrain");
+	s->world_dirty = false;
+}
+
+void scene_world_ux(Scene* s, GameWindow* window)
+{
+	ImDrawList* dl = ImGui::GetBackgroundDrawList();
+	float scale = window->screen_height / 1080.f;
+	float panel = ux_panel_visible ? ux_panel_width(window) : 0.f;
+	float cx = (window->screen_width + panel) * .5f;
+
+	ImU32 title = IM_COL32(235, 238, 243, 225);
+	ImU32 dim   = IM_COL32(170, 178, 190, 200);
+
+	char sub[160];
+	vec3 pp = s->player.voxel_pos;
+	float ph = world_height_at(world_config, pp.x, pp.z);
+	float pt = world_temperature(world_config, pp.x, pp.z);
+	float pm = world_humidity(world_config, pp.x, pp.z);
+	World_Biome biome = world_biome_at((int)(ph + .5f), 0, pt, pm, world_config);
+	snprintf(sub, sizeof(sub), "seed %u  |  chunk %d, %d  |  %s  |  %u chunks  |  %u faces",
+	         world_config.seed, s->world.center_cx, s->world.center_cz,
+	         WORLD_BIOME_NAMES[biome], s->world.num_chunks, s->world.faces);
+
+	hud_text_center(dl, 24.f * scale, cx, 36.f * scale, title, "WORLD");
+	hud_text_center(dl, 14.f * scale, cx, 70.f * scale, dim, sub);
+	if (!s->player.inventory_open)
+		hud_text_center(dl, 13.f * scale, cx, window->screen_height - 42.f * scale, dim,
+		                "WASD move  |  SHIFT sprint  |  SPACE jump  |  F flycam  |  E inventory");
+	if (!s->player.inventory_open && !s->player.flycam)
+		hud_crosshair(dl, cx, window->screen_height * .5f, scale, IM_COL32(235, 238, 243, 190));
+	if (!s->player.inventory_open) draw_hotbar(s, window);
+	draw_inventory(s, window);
+}
+
+void scene_terrain_ux(Scene* s, GameWindow* window)
+{
+	ImDrawList* dl = ImGui::GetBackgroundDrawList();
+	float scale = window->screen_height / 1080.f;
+	float panel = ux_panel_visible ? ux_panel_width(window) : 0.f;
+	float cx = (window->screen_width + panel) * .5f;
+
+	ImU32 title = IM_COL32(235, 238, 243, 225);
+	ImU32 dim   = IM_COL32(170, 178, 190, 200);
+
+	char sub[160];
+	vec3 pp = s->camera.position;
+	float ph = world_height_at(world_config, pp.x, pp.z);
+	float pt = world_temperature(world_config, pp.x, pp.z);
+	float pm = world_humidity(world_config, pp.x, pp.z);
+	World_Biome biome = world_biome_at((int)(ph + .5f), 0, pt, pm, world_config);
+	snprintf(sub, sizeof(sub), "seed %u  |  chunk %d, %d  |  %s  |  %u chunks  |  %u faces",
+	         world_config.seed, s->world.center_cx, s->world.center_cz,
+	         WORLD_BIOME_NAMES[biome], s->world.num_chunks, s->world.faces);
+
+	hud_text_center(dl, 24.f * scale, cx, 36.f * scale, title, "TERRAIN");
+	hud_text_center(dl, 14.f * scale, cx, 70.f * scale, dim, sub);
+	hud_text_center(dl, 13.f * scale, cx, window->screen_height - 42.f * scale, dim,
+	                "WASD fly  |  SHIFT fast  |  mouse look  |  terrain controls under Scenes");
 }
 const uint PHYSICS_TRIGGER_COUNT = 3;
 const int  PHYS_FLAG_COLS = 16;
@@ -1101,7 +2237,7 @@ void physics_add_button(Scene* s, uint cube_mesh, uint cylinder_mesh)
 	Scene::Prop& cap = s->add_prop(cylinder_mesh, cap_at, 0, vec3(.45f, .15f, .45f));
 	cap.rot = mat3(glm::rotate(mat4(1), PI / 2, vec3(1, 0, 0)));
 	cap.mat_a = ACTIVE_OFF;
-	cap.mat_b = vec4(.25f, 1.f, 0.f, 0.f);
+	cap.mat_b = vec4(.14f, 1.f, 0.f, 0.f);
 	snprintf(cap.label, sizeof(cap.label), "BTN");
 
 	physics_controls.button_body = s->phys.add_box(cap_at, vec3(.3f, .3f, .16f), 0);
@@ -2377,6 +3513,103 @@ void scene_shallow_debug(Scene* s)
 	if (ImGui::Button("reset lighting")) s->lighting = lighting_preset(s->lighting_kind);
 }
 
+// ---- world : seed, stream state and respawn --------------------------------
+void scene_world_debug(Scene* s)
+{
+	int seed = (int)world_config.seed;
+	if (ImGui::DragInt("seed", &seed, 1, 0, 10000000))
+	{
+		world_config.seed = (uint)seed;
+		s->reload_requested = true;
+	}
+
+	ImGui::SameLine();
+	if (ImGui::Button("regenerate")) s->reload_requested = true;
+
+	ImGui::Text("chunk %d, %d  |  %u loaded  |  %u solid  |  %u faces  |  %u verts",
+	            s->world.center_cx, s->world.center_cz, s->world.num_chunks,
+	            s->world.solid_blocks, s->world.faces, s->world.vertices);
+
+	vec3 pos = s->player.voxel_mode ? s->player.voxel_pos
+	                              : s->phys.get_position(s->player.body);
+	ImGui::Text("player %.1f %.1f %.1f", pos.x, pos.y, pos.z);
+	if (ImGui::Button("respawn on the surface"))
+	{
+		vec3 spawn;
+		if (world_spawn(&s->world, world_config, &spawn))
+		{
+			if (s->player.voxel_mode)
+			{
+				s->player.voxel_pos = spawn;
+				s->player.voxel_vel = vec3(0);
+				s->player.camera.position = spawn + vec3(0, 1.62f, 0);
+			}
+			else
+				s->phys.set_body_pose(s->player.body, spawn);
+		}
+	}
+
+	ImGui::Separator();
+	ImGui::TextDisabled("chunks stream on a %d x %d view around the player",
+	                    WORLD_VIEW_CHUNKS, WORLD_VIEW_CHUNKS);
+	if (ImGui::Checkbox("surface water", &world_config.water)) s->reload_requested = true;
+
+	ImGui::Separator();
+	int preset = (int)s->lighting_kind;
+	if (ImGui::Combo("lighting preset", &preset, LIGHTING_PRESET_NAMES, LIGHT_PRESET_COUNT))
+		s->use_lighting((uint)preset);
+	ImGui::SliderFloat("cloud weather", &s->lighting.cloud_weather, 0.f, 1.f, "%.2f");
+}
+
+// ---- terrain : live generation controls for the large preview --------------
+void scene_terrain_debug(Scene* s)
+{
+	if (ImGui::Button("regenerate")) s->world_dirty = true;
+	ImGui::SameLine();
+	if (ImGui::Button("random seed"))
+	{
+		world_config.seed = (uint)(ImGui::GetTime() * 100000.0);
+		s->world_dirty = true;
+	}
+
+	int seed = (int)world_config.seed;
+	if (ImGui::DragInt("seed", &seed, 1, 0, 10000000))
+	{
+		world_config.seed = (uint)seed;
+		s->world_dirty = true;
+	}
+	if (ImGui::SliderFloat("sea level", &world_config.sea_level, 8.f, 70.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("continent scale", &world_config.continent_scale, 80.f, 500.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("continent height", &world_config.continent_amplitude, 0.f, 40.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("erosion scale", &world_config.erosion_scale, 40.f, 300.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("ridge scale", &world_config.ridge_scale, 30.f, 200.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("mountain height", &world_config.mountain_amplitude, 0.f, 60.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("detail scale", &world_config.detail_scale, 8.f, 80.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("detail height", &world_config.detail_amplitude, 0.f, 12.f, "%.1f"))
+		s->world_dirty = true;
+	if (ImGui::SliderFloat("domain warp", &world_config.warp, 0.f, 30.f, "%.0f"))
+		s->world_dirty = true;
+	if (ImGui::Checkbox("surface water", &world_config.water))
+		s->world_dirty = true;
+
+	ImGui::Separator();
+	ImGui::TextDisabled("view");
+	ImGui::SliderFloat("fly speed", &s->fly_speed_scale, 1.f, 40.f, "%.1f");
+
+	ImGui::Separator();
+	ImGui::Text("chunk %d, %d  |  %u chunks  |  %u faces  |  %u verts",
+	            s->world.center_cx, s->world.center_cz, s->world.num_chunks,
+	            s->world.faces, s->world.vertices);
+	ImGui::TextDisabled("the world scene reuses these generation settings");
+}
+
 void physics_view_station(Scene* s, uint station)
 {
 	if (station >= PST_COUNT) return;
@@ -2661,6 +3894,8 @@ enum SceneKind {
 	SCENE_RENDER,
 	SCENE_WATER,
 	SCENE_SHALLOW,
+	SCENE_WORLD,
+	SCENE_TERRAIN,
 	SCENE_KIND_COUNT
 };
 
@@ -2679,6 +3914,8 @@ static const Scene_Def SCENE_DEFS[SCENE_KIND_COUNT] = {
 	{ "render",    scene_render,    scene_render_ux,    scene_render_debug },
 	{ "ocean",     scene_water,     scene_water_ux,     scene_water_debug },
 	{ "shallow",   scene_shallow,   scene_shallow_ux,   scene_shallow_debug },
+	{ "world",     scene_world,     scene_world_ux,     scene_world_debug },
+	{ "terrain",   scene_terrain,   scene_terrain_ux,   scene_terrain_debug },
 };
 
 // owns exactly one scene. a request is applied at the top of the next frame, so
@@ -2718,6 +3955,8 @@ struct SceneManager
 		else if (!loaded || requested_kind != current_kind)
 			load(renderer, requested_kind);
 
+		window->water_underwater = false; // each water scene re-enables it this frame
+
 		// water evolves every frame and refills its geometry before the draw pass
 		if (loaded && current_kind == SCENE_WATER)
 		{
@@ -2730,6 +3969,34 @@ struct SceneManager
 		{
 			shallow_scene_update(&scene, renderer, window->dtime);
 			shallow_bind_window(window, scene.shallow.time);
+		}
+
+		// the world and terrain scenes stream chunks around the active camera
+		if (loaded && (current_kind == SCENE_WORLD || current_kind == SCENE_TERRAIN))
+		{
+			world_scene_update(&scene, renderer, window->dtime);
+			if (current_kind == SCENE_WORLD)
+				player_world_interact(&scene, window, renderer);
+			world_collect_lights(&scene);
+			world_water_bind_window(window, scene.world.water_time);
+
+			// only the water column under the eye counts : flying down over land is
+			// not a dive, and the sea plane must not hang above a dry valley
+			float water_y = world_config.sea_level + scene.world.render_offset_y;
+			int wx = world_floor(scene.camera.position.x);
+			int wz = world_floor(scene.camera.position.z);
+			float terrain_h = world_height_at(world_config, (float)wx, (float)wz);
+			bool in_water = scene.camera.position.y < water_y
+			             && terrain_h < (float)world_config.sea_level;
+			if (scene.world_water_prop >= 0 && scene.world_water_prop < (int)scene.num_props)
+			{
+				bool hide = scene.camera.position.y < water_y - .10f && !in_water;
+				scene.props[scene.world_water_prop].pos.y = hide ? -10000.f : 0.f;
+			}
+			window->water_underwater = in_water;
+			window->water_level = water_y;
+			window->underwater_color = vec3(.010f, .060f, .190f);
+			window->underwater_density = .060f;
 		}
 
 		// replace the soft-body geometry before instance submission : a rewind

@@ -4,7 +4,7 @@
 	-    Asset Loading      -
  * ------------------------- */
 
-const uint MAX_MESHES   = 128;
+const uint MAX_MESHES   = 32768;
 const uint MAX_TEXTURES = 16;
 
 struct Mesh_Data
@@ -223,6 +223,15 @@ struct TextureLoader
 		}
 	}
 
+	// approximate GPU bytes : RGBA8 plus a third for the mip chain
+	size_t memory_bytes() const
+	{
+		size_t bytes = 0;
+		for (uint i = 0; i < num_textures; i++)
+			bytes += (size_t)textures[i].width * (size_t)textures[i].height * 4u;
+		return bytes + bytes / 3u;
+	}
+
 	// delete every texture and forget the slots : init() reloads the default
 	void clear()
 	{
@@ -321,6 +330,40 @@ struct ShaderProgram
 
 		glDeleteShader(vert_shader);
 		glDeleteShader(frag_shader);
+	}
+
+	// compute programs : one stage, no vertex input. used for the cloud noise bake
+	void create_compute(const char* path)
+	{
+		char* source = (char*)read_text_file_into_memory(path);
+		GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+		glShaderSource(shader, 1, &source, NULL);
+		glCompileShader(shader);
+		free(source);
+
+		GLint compiled = 0;
+		glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+		if (!compiled) log_shader_error(shader, "COMPUTE SHADER", path);
+
+		id = glCreateProgram();
+		glAttachShader(id, shader);
+		glLinkProgram(id);
+
+		glGetProgramiv(id, GL_LINK_STATUS, &link_status);
+		glGetProgramiv(id, GL_ACTIVE_UNIFORMS, &num_uniforms);
+		num_attributes = 0;
+
+		if (!link_status)
+		{
+			GLsizei length = 0;
+			char error[256] = {};
+			glGetProgramInfoLog(id, 256, &length, error);
+			char msg[MAX_LOG_MSG_LENGTH];
+			snprintf(msg, MAX_LOG_MSG_LENGTH, "COMPUTE LINK FAILED [%s]: %.40s", path, error);
+			console->add_entry(msg, FIXME, RNDR);
+		}
+
+		glDeleteShader(shader);
 	}
 
 	// pull the compiler log for a failed shader into the in-app console

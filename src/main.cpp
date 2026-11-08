@@ -48,35 +48,64 @@ int main()
 		game_handle_keys(window);
 		if (game_exit_requested) break;
 
+		double t_phase = glfwGetTime();
 		if (game_screen != GAME_SCREEN_PAUSED)
 			scenes->update(window, renderer); // builds a requested scene before updating it
 		scene = &scenes->scene;
+		window->phase_update_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
 
-		renderer->draw_shadows(window, scene->lighting, scene->camera.position,
-		                       scene->camera.front, scene->shadow_extent); // sun depth pass
+		t_phase = glfwGetTime();
+		if (scene->shadows && window->render_shadows)
+			renderer->draw_shadows(window, scene->lighting, scene->camera.position,
+			                       scene->camera.front, scene->shadow_extent); // sun depth pass
+		else
+			window->shadow_on = false;
+		window->phase_shadow_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
+
+		t_phase = glfwGetTime();
 		renderer->draw(window, scene->proj_view);  // opaque pass into the gbuf
+		window->phase_gbuf_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
+
+		t_phase = glfwGetTime();
 		window->draw_lighting(scene->camera.position, scene->proj_view, &scene->lighting); // sun + ambient
 		renderer->draw_light_volumes(window, scene->proj_view, scene->camera.position,
 		                             scene->lights,
 		                             scene->local_lights ? scene->num_lights : 0); // local lights, additive
+		window->phase_light_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
+
+		t_phase = glfwGetTime();
 		window->draw_sky_disks(&scene->lighting, scene->proj_view,
 		                       scene->camera.position); // disks over opaque sky only
+		if (window->render_clouds)
+			window->draw_clouds(scene->proj_view, scene->camera.position,
+			                    &scene->lighting); // half-res volumetric clouds
+		window->phase_cloud_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
+
+		t_phase = glfwGetTime();
 		renderer->draw_water(window, scene->proj_view, scene->camera.position,
 		                     scene->lighting); // forward water covers the disks
+		window->phase_water_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
+
+		t_phase = glfwGetTime();
 		window->post_process(&scene->lighting); // exposure, ACES, display encode
+		window->phase_post_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
 
 		// one shared wire pass : physics, light volumes and scene guides
 		debug_draw.begin();
 		scene->phys.append_debug();
 		renderer->append_light_debug(scene->lights, scene->num_lights, scene->light_floor_y);
+		world_append_placement_preview(scene);
 		debug_draw.append_axes(5.f);
 		debug_draw.append_frustum(scene->proj_view, vec4(.20f, .85f, 1.f, 1.f));
 		debug_draw.draw(scene->proj_view);
 
+		t_phase = glfwGetTime();
 		draw_console(console, renderer, window, scenes);
 		draw_game_menus(window, scenes);
+		draw_performance_overlay(window, renderer, scene);
 		ImGui::Render();
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+		window->phase_ui_ms = (float)((glfwGetTime() - t_phase) * 1000.0);
 
 		window->end_frame(); // calculate frame time, sleep
 		if (game_exit_requested) break;
